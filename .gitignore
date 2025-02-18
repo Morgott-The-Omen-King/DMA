@@ -62,3 +62,5 @@ scripts/
 # Data and pretrained models
 
 
+data
+pretrain_model
