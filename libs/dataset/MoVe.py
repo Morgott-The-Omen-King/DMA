@@ -138,18 +138,30 @@ class ActionHierarchy:
 
 
 class MoVeDataset(Dataset):
-    def __init__(self, data_path=None, train=True, valid=False,
-                 set_index=1, finetune_idx=None,
-                 support_frames=10, query_frames=1,  # N-way-K-shot setting
-                 num_ways=1, num_shots=5,  # N-way-K-shot setting
-                 transforms=None, another_transform=None, group=0, setting='default'):
+    def __init__(self, 
+                 train=True, 
+                 valid=False,
+                 finetune_idx=None,
+                 support_frames=10, 
+                 query_frames=1,  # N-way-K-shot setting
+                 num_ways=1, 
+                 num_shots=5,  # N-way-K-shot setting
+                 transforms=None, 
+                 another_transform=None, 
+                 group=0, 
+                 setting='default',
+                 sample_method='hard'):
         self.train = train
         self.valid = valid
-        self.set_index = set_index
+        
+        self.sample_method = sample_method
+        assert self.sample_method in ['hard', 'random'], 'sample_method must be either "hard" or "random"'
+        
         self.support_frames = support_frames
         self.query_frames = query_frames
         self.num_ways = num_ways  # N-way
         self.num_shots = num_shots  # K-shot
+        
         self.transforms = transforms
         self.another_transform = another_transform
         self.group = group
@@ -204,7 +216,6 @@ class MoVeDataset(Dataset):
         # Sort categories for reproducibility
         self.action_categories = sorted(list(self.action_categories))
         
-        # # Randomly select test categories
         # Load action groups from JSON
         if setting == 'default':
             action_groups_path = os.path.join(os.path.dirname(self.ann_dir), 'action_groups.json')
@@ -214,8 +225,8 @@ class MoVeDataset(Dataset):
         with open(action_groups_path, 'r') as f:
             action_groups = json.load(f)
         
-        # Determine train and test categories based on group
-        test_categories = action_groups[self.group]['actions']
+        # 只选择两个类别
+        test_categories = action_groups[self.group]['actions'][:2]  # 只取前两个类别
         train_categories = [cat for cat in self.action_categories if cat not in test_categories]
         self.train_categories = train_categories
         self.test_categories = test_categories
@@ -224,18 +235,25 @@ class MoVeDataset(Dataset):
             self.selected_categories = train_categories
         else:
             self.selected_categories = test_categories
+        
+        self.selected_categories = ["daily_action-sign_language-cool"]
             
-        # Update video IDs to only include those from selected categories
+        # 限制每个类别的视频数量
         self.video_ids = []
-        for category in self.selected_categories:
-            self.video_ids.extend(self.category_to_videos[category])
-        self.video_ids = list(set(self.video_ids))  # Remove duplicates
-            
+        for i, category in enumerate(self.selected_categories):
+            videos = self.category_to_videos[category]
+            if i == 0:  # 第一个类别只选1个视频
+                self.video_ids.extend(videos[:2])
+            else:  # 第二个类别选2个视频
+                self.video_ids.extend(videos[:2])
+        
         if finetune_idx is not None:
             self.video_ids = [self.video_ids[finetune_idx]]
 
         print(f"{'Train' if train else 'Test'} set: {len(self.video_ids)} videos")
         print(f"Number of action categories: {len(self.selected_categories)}")
+        if len(self.selected_categories) < self.num_ways:
+            raise ValueError(f"Not enough categories for {self.num_ways}-way setting")
 
         if train and not valid:
             self.action_hierarchy = ActionHierarchy(action_groups_path, self.group, train=True)
@@ -374,22 +392,59 @@ class MoVeDataset(Dataset):
         # 合并所有选择的帧并按时间顺序排序
         selected_frames = sorted(selected_action_frames + selected_other_frames)
         return selected_frames
-
-    def get_consecutive_frames(self, center_frame, num_frames, max_frame):
-        """获取以center_frame为中心的连续帧序列
+    
+    def sample_frames_with_action_support(self, valid_frames, all_frames, num_frames):
+        """采样支持帧，确保采样完整的动作序列
         Args:
-            center_frame: 中心帧索引
-            num_frames: 需要的帧数
-            max_frame: 最大帧索引
+            valid_frames: 包含目标动作的帧列表
+            all_frames: 所有可用帧列表 
+            num_frames: 需要采样的总帧数
         Returns:
-            连续帧序列
+            采样的帧索引列表
         """
-        half = num_frames // 2
-        start_idx = max(0, center_frame - half)
-        end_idx = min(max_frame, start_idx + num_frames)
-        start_idx = max(0, end_idx - num_frames)  # 调整起始位置以确保获取足够的帧数
-        return list(range(start_idx, end_idx))
-
+        if not valid_frames:
+            # 如果没有有效动作帧，则等间距采样
+            if len(all_frames) <= num_frames:
+                return sorted(all_frames)
+            step = len(all_frames) // num_frames
+            return sorted(all_frames[::step][:num_frames])
+            
+        # 找到连续的动作片段
+        action_segments = []
+        current_segment = []
+        for i in range(len(valid_frames)):
+            if not current_segment or valid_frames[i] == current_segment[-1] + 1:
+                current_segment.append(valid_frames[i])
+            else:
+                action_segments.append(current_segment)
+                current_segment = [valid_frames[i]]
+        if current_segment:
+            action_segments.append(current_segment)
+            
+        # 选择最长的动作片段
+        longest_segment = max(action_segments, key=len)
+        
+        if len(longest_segment) >= num_frames:
+            # 如果最长片段长度大于需要的帧数，等间距采样
+            step = len(longest_segment) // num_frames
+            return sorted(longest_segment[::step][:num_frames])
+        else:
+            # 如果最长片段长度小于需要的帧数，向两边扩展采样
+            center = longest_segment[len(longest_segment)//2]
+            left = center - 1
+            right = center + 1
+            selected_frames = longest_segment.copy()
+            
+            while len(selected_frames) < num_frames and (left >= 0 or right < len(all_frames)):
+                if left >= 0 and len(selected_frames) < num_frames:
+                    selected_frames.append(left)
+                    left -= 1
+                if right < len(all_frames) and len(selected_frames) < num_frames:
+                    selected_frames.append(right)
+                    right += 1
+                    
+            return sorted(selected_frames[:num_frames])
+    
     def __getitem__(self, idx):
         if self.train:
             return self.__gettrainitem__(idx)
@@ -397,17 +452,16 @@ class MoVeDataset(Dataset):
             return self.__gettestitem__(idx)
 
     def __gettrainitem__(self, idx):
-        # Randomly select N action categories
-        if len(self.selected_categories) < self.num_ways:
-            raise ValueError(f"Not enough categories for {self.num_ways}-way setting")
         # selected_categories = random.sample(self.selected_categories, self.num_ways)
         # Prepare support and query data
         all_support_frames = []
         all_support_masks = []
         all_query_frames = []
         all_query_masks = []
-        if random.random() < 0.7:
-            selected_categories = self.action_hierarchy.sample_fine_grained_episode(self.num_ways + 1)
+
+        # if random.random() < 0.7:
+        if False:
+            selected_categories = self.action_hierarchy.sample_fine_grained_episode(self.num_ways)
             query_category = random.choice(selected_categories)
             selected_categories = selected_categories[:self.num_ways]
 
@@ -426,7 +480,9 @@ class MoVeDataset(Dataset):
                 # remaining_videos = [v for v in category_videos if v not in support_video_ids]
                 query_video_id = random.choice(category_videos)
         else:
-            selected_categories = random.sample(self.selected_categories, self.num_ways)
+            selected_categories = self.selected_categories
+            query_category = selected_categories[0]
+            selected_categories = selected_categories[:self.num_ways]
         
             # Find videos that contain at least one of the selected categories
             eligible_query_videos = []
@@ -440,10 +496,6 @@ class MoVeDataset(Dataset):
             # # Randomly select one query video
             # query_video_id = random.choice(eligible_query_videos)
             
-
-            
-            # First get the query frames from one random category
-            query_category = random.choice(selected_categories)
             # 获取该类别的所有视频
             category_videos = self.category_to_videos[query_category]
             
@@ -458,9 +510,9 @@ class MoVeDataset(Dataset):
                 # 从剩余视频中选择query视频
                 # remaining_videos = [v for v in category_videos if v not in support_video_ids]
                 query_video_id = random.choice(category_videos)
-
-
+        query_video_id = 'b2b1orzu9hex'
         valid_query_frames, all_query_frames_list = self.get_valid_frames(query_video_id, query_category)
+        print(query_video_id, query_category)
         
         # 为query帧确保至少包含1个动作帧
         query_indices = self.sample_frames_with_action(
@@ -487,12 +539,10 @@ class MoVeDataset(Dataset):
             for support_video_id in support_video_ids:
                 valid_support_frames, all_support_frames_list = self.get_valid_frames(support_video_id, category)
                 
-                # 为support帧确保至少包含2个动作帧
-                shot_indices = self.sample_frames_with_action(
+                shot_indices = self.sample_frames_with_action_support(
                     valid_support_frames,
                     all_support_frames_list,
-                    self.support_frames,
-                    min_action_frames=2
+                    self.support_frames
                 )
                 
                 frames, masks = self.get_frames(support_video_id, shot_indices, category)
@@ -514,16 +564,8 @@ class MoVeDataset(Dataset):
 
         # Apply transforms
         if self.transforms is not None:
-            try:
-                query_frames, query_masks = self.transforms(all_query_frames, all_query_masks)
-                support_frames, support_masks = self.transforms(all_support_frames, all_support_masks)
-            except Exception as e:
-                print(f"Error applying transforms: {e}")
-                print(f"Query frames shape: {len(all_query_frames)}")
-                print(f"Query masks shape: {len(all_query_masks)}")
-                print(f"Support frames shape: {len(all_support_frames)}")
-                print(f"Support masks shape: {len(all_support_masks)}")
-                raise e
+            query_frames, query_masks = self.transforms(all_query_frames, all_query_masks)
+            support_frames, support_masks = self.transforms(all_support_frames, all_support_masks)
 
         return query_frames, query_masks, support_frames, support_masks, [query_video_id]
 
@@ -585,11 +627,10 @@ class MoVeDataset(Dataset):
             # 获取支持集视频的帧
             for support_video_id in support_video_ids:
                 valid_support_frames, all_support_frames_list = self.get_valid_frames(support_video_id, category)
-                shot_indices = self.sample_frames_with_action(
+                shot_indices = self.sample_frames_with_action_support(
                     valid_support_frames,
                     all_support_frames_list,
                     self.support_frames,
-                    min_action_frames=2
                 )
                 
                 frames, masks = self.get_frames(support_video_id, shot_indices, category)
@@ -611,15 +652,26 @@ class MoVeDataset(Dataset):
         
         # 应用数据增强
         if self.transforms is not None:
-            try:
-                query_frames, query_masks = self.transforms(all_query_frames, all_query_masks)
-                support_frames, support_masks = self.transforms(all_support_frames, all_support_masks)
-            except Exception as e:
-                print(f"Error applying transforms: {e}")
-                raise e
+            query_frames, query_masks = self.transforms(all_query_frames, all_query_masks)
+            support_frames, support_masks = self.transforms(all_support_frames, all_support_masks)
         
         return query_frames, query_masks, support_frames, support_masks, [query_video_id], selected_categories
 
     def __len__(self):
         # 返回一个足够大的数字，使得可以进行足够多的episode
-        return 1000000  # 这个数字可以根据需要调整 
+        return 10000000  # 这个数字可以根据需要调整 
+
+
+if __name__ == '__main__':
+    
+    from libs.dataset.transform import TrainTransform
+    size = (241, 425)
+    train_transform = TrainTransform(size)
+    # dataset = MoVeDataset(train=False, valid=True, num_ways=2, num_shots=1, sample_method='hard', transforms=train_transform)
+    # print(len(dataset))
+    # query_frames, query_masks, support_frames, support_masks, query_video_id, selected_categories = dataset[0]
+    # print(query_frames.shape, query_masks.shape, support_frames.shape, support_masks.shape, query_video_id, selected_categories)
+    dataset = MoVeDataset(train=True, valid=False, num_ways=2, num_shots=1, sample_method='hard', transforms=train_transform, group=0)
+    print(len(dataset))
+    query_frames, query_masks, support_frames, support_masks, query_video_id = dataset[0]
+    print(query_frames.shape, query_masks.shape, support_frames.shape, support_masks.shape)
