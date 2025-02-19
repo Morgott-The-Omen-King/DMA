@@ -12,7 +12,8 @@ class DMA(nn.Module):
                  n_way=2, 
                  k_shot=1, 
                  num_support_frames=5, 
-                 backbone='resnet50'):
+                 backbone='resnet50',
+                 hidden_dim=256):
         super().__init__()
         self.n_way = n_way
         self.k_shot = k_shot
@@ -24,7 +25,7 @@ class DMA(nn.Module):
         self.build_backbone()
             
         # 特征维度
-        self.hidden_dim = 256
+        self.hidden_dim = hidden_dim
         
         # Motion-Appearance解耦模块
         self.motion_encoder = nn.Sequential(
@@ -63,6 +64,18 @@ class DMA(nn.Module):
             for _ in range(6)  # 6层
         ])
         
+        # mask_feats head
+        # 1x1 convolutions for adjusting channel dimensions
+        self.layer2_conv = nn.Conv2d(self.feat_dims['layer2'], self.hidden_dim, 1)
+        self.layer3_conv = nn.Conv2d(self.feat_dims['layer3'], self.hidden_dim, 1)
+        
+        # Final 1x1 conv for fusing multi-scale features
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(self.hidden_dim, self.hidden_dim, 1),
+            nn.BatchNorm2d(self.hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+        
         # 特征映射层
         self.motion_proj = nn.Linear(self.feat_dim, self.hidden_dim)
         self.appear_proj = nn.Linear(self.feat_dim, self.hidden_dim)
@@ -71,6 +84,26 @@ class DMA(nn.Module):
         
         # 分割头
         self.decoder = MaskFormerDecoder(self.hidden_dim)
+        
+        self.mask_head = nn.Conv2d(self.hidden_dim, self.n_way, kernel_size=1)
+
+        # Initialize weights
+        self.init_weights()
+    
+    def init_weights(self):
+        """Initialize network weights"""
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Conv3d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d, nn.LayerNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+                
+        # Special initialization for meta motion queries and positional embeddings
+        nn.init.normal_(self.meta_motion_queries, std=0.02)
+        nn.init.normal_(self.query_pos_embed, std=0.02)
     
     @property
     def device(self):
@@ -81,19 +114,58 @@ class DMA(nn.Module):
         # 加载预训练的ResNet50
         backbone = resnet50(pretrained=True)
         
-        # 移除最后的全连接层和平均池化层
-        self.backbone = nn.Sequential(*list(backbone.children())[:-2])
+        # 获取不同层的特征
+        self.layer1 = nn.Sequential(*list(backbone.children())[:5])  # 1/4
+        self.layer2 = backbone.layer2  # 1/8 
+        self.layer3 = backbone.layer3  # 1/16
+        self.layer4 = backbone.layer4  # 1/32
         
-        # 设置特征维度
-        self.feat_dim = 2048  # ResNet50的输出通道数
+        # 设置各层特征维度
+        self.feat_dims = {
+            'layer1': 256,   # layer1 output
+            'layer2': 512,   # layer2 output  
+            'layer3': 1024, # layer3 output
+            'layer4': 2048  # layer4 output
+        }
         
-    def extract_features(self, rgb_input):
-        """使用骨干网络提取特征"""
-        B = rgb_input.shape[0]
-        # 重塑输入以适应2D CNN
-        rgb_input = rgb_input.view(-1, 3, rgb_input.shape[-2], rgb_input.shape[-1])
-        # 提取特征
-        features = self.backbone(rgb_input)
+        self.feat_dim = 256  # 保持主特征维度不变
+        
+    def extract_features(self, rgb_input, mask_feats=False):
+        """使用骨干网络提取多尺度特征"""
+        # 提取多尺度特征
+        feat_1_4 = self.layer1(rgb_input)
+        feat_1_8 = self.layer2(feat_1_4)
+        feat_1_16 = self.layer3(feat_1_8)
+        feat_1_32 = self.layer4(feat_1_16)
+        
+        # 返回多尺度特征字典
+        features = {
+            'layer1': feat_1_4,
+            'layer2': feat_1_8,
+            'layer3': feat_1_16,
+            'layer4': feat_1_32
+        }
+        
+        if mask_feats:
+            # 将layer2和layer3上采样到layer1尺度
+            feat_1_8_up = F.interpolate(
+                self.layer2_conv(feat_1_8),  # 1x1 conv to adjust channels
+                size=feat_1_4.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+            
+            feat_1_16_up = F.interpolate(
+                self.layer3_conv(feat_1_16),  # 1x1 conv to adjust channels 
+                size=feat_1_4.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+            
+            # 将多尺度特征相加并通过1x1卷积融合
+            mask_feats = self.fusion_conv(feat_1_4 + feat_1_8_up + feat_1_16_up)
+            features['mask_feats'] = mask_feats
+            
         return features
     
     def get_sinusoid_encoding(self, time_pos, d_hid):
@@ -117,7 +189,6 @@ class DMA(nn.Module):
         return sinusoid_table
         
     def forward(self, query_video, support_video, support_mask):
-        """前向传播"""
         # Shape检查
         B, T, C, H, W = query_video.shape
         assert C == 3, f"Expected 3 channels, got {C}"
@@ -126,12 +197,35 @@ class DMA(nn.Module):
         
         # Step 1: 特征提取
         # Query视频特征
-        query_feats = self.extract_features(query_video.reshape(B*T, C, H, W))  # todo:这个地方可能需要提取多尺度的特征
+        query_feats = self.extract_features(query_video.reshape(B*T, C, H, W), mask_feats=True)  # todo:这个地方可能需要提取多尺度的特征
+        
+        query_mask_feats, query_feats = query_feats['mask_feats'], query_feats['mask_feats']
+        
+        feat_h, feat_w = query_mask_feats.shape[-2:]
+        # # Convert query mask features to n-way classification mask
+        # query_mask_feats = query_mask_feats.view(B*T, self.hidden_dim, feat_h, feat_w)
+        # query_mask_logits = self.mask_head(query_mask_feats)  # Convert to n-way logits
+        # query_mask_logits = query_mask_logits.view(B, T, self.n_way, feat_h, feat_w)
+        
+        # # Upsample to original resolution
+        # query_mask_logits = F.interpolate(
+        #     query_mask_logits.view(B*T, self.n_way, feat_h, feat_w),
+        #     size=(H, W),
+        #     mode='bilinear',
+        #     align_corners=False
+        # )
+        # query_mask_logits = query_mask_logits.view(B, T, self.n_way, H, W).sigmoid()
+        # query_mask_logits = query_mask_logits.permute(0,2,1,3,4)
+        # return query_mask_logits
+        
+        
         feat_h, feat_w = query_feats.shape[-2:]  # 获取特征图的实际高宽
         query_feats = query_feats.view(B, T, self.feat_dim, feat_h, feat_w)
         
         # Support视频特征
-        support_feats = self.extract_features(support_video.view(-1, C, H, W)).view(B, self.n_way, self.k_shot, self.num_support_frames, self.feat_dim, feat_h, feat_w)
+        support_feats = self.extract_features(support_video.view(-1, C, H, W), mask_feats=True)
+        support_mask_feats, support_feats = support_feats['mask_feats'], support_feats['mask_feats']
+        support_feats = support_feats.view(B, self.n_way, self.k_shot, self.num_support_frames, self.feat_dim, feat_h, feat_w)
         # 提取对应的support对应的appearance feat以及motion feat
         # 1. 提取使用mask pooling得到对应前景特帧，这个表示物体的appearance 特征
         # 2. 将两两帧之间的appearance特征进行相减，得到对应的motion 特帧
@@ -153,10 +247,11 @@ class DMA(nn.Module):
         
         # 2. 计算相邻帧之间的差异得到motion特征
         # 使用切片并行计算相邻帧差异
-        motion_feats = appearance_feats[..., 1:, :] - appearance_feats[..., :-1, :]
-        # 补充一个空的motion特征,保持时间维度一致
-        zero_motion = torch.zeros_like(motion_feats[...,:1,:])
-        motion_feats = torch.cat([motion_feats, zero_motion], dim=3)
+        # motion_feats = appearance_feats[..., 1:, :] - appearance_feats[..., :-1, :]
+        # # 补充一个空的motion特征,保持时间维度一致
+        # zero_motion = torch.zeros_like(motion_feats[...,:1,:])
+        # motion_feats = torch.cat([motion_feats, zero_motion], dim=3)
+        motion_feats = appearance_feats
         
         # 将motion和appearance特征映射到hidden_dim
         motion_feats = self.motion_proj(motion_feats)
@@ -233,7 +328,7 @@ class DMA(nn.Module):
             meta_motion_queries = norm4(meta_motion_queries)
         
         # 5. 获取meta-motion prototype
-        # meta_motion_prototype = meta_motion_queries.view(B, self.n_way, self.num_meta_motion_queries, self.hidden_dim)
+        meta_motion_prototype = meta_motion_queries.view(B, self.n_way, self.num_meta_motion_queries, self.hidden_dim)
         
         # 最后阶段，使用对应的mask_head
         # 利用类似mask2former中的mask_head结构
@@ -241,10 +336,11 @@ class DMA(nn.Module):
         # 输出为mask: (b, n_way, num_meta_motion_query, T, h, w)
         # 最终将按num_meta_motion_query相加变为 (b, n_way, T, h, w)
         B, T = query_feats.shape[:2]
-        query_feats = query_feats.view(B*T, *query_feats.shape[2:])
-        query_feats = self.query_proj(query_feats)
-        query_feats = query_feats.view(B, T, *query_feats.shape[1:])
-        mask = self.decoder(query_feats, meta_motion_queries)  # B, N_way, T, H, W
+        # query_feats = query_feats.view(B*T, *query_feats.shape[2:])
+        # query_feats = self.query_proj(query_feats)
+        # query_feats = query_feats.view(B, T, *query_feats.shape[1:])
+        query_mask_feats = query_mask_feats.view(B, T, *query_mask_feats.shape[1:])
+        mask = self.decoder(query_mask_feats, meta_motion_queries)  # B, N_way, T, H, W
         
         resize_mask = F.interpolate(mask.flatten(0,1), size=(H, W), mode='bilinear', align_corners=False).view(B, self.n_way, T, H, W).sigmoid()  # B n t h w
         
