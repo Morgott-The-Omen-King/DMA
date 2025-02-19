@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore")
+
 import argparse
 import json
 import os
@@ -10,17 +13,15 @@ import datetime
 import glob
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import LambdaLR
 
 from libs.config.DAN_config import OPTION as opt
-from libs.utils.Logger import TreeEvaluation as Evaluation, TimeRecord, LogTime, Tee, Loss_record
-from libs.utils.Restore import get_save_dir, restore, save_model
+from libs.utils.Logger import TreeEvaluation as Tee, Loss_record
 from libs.utils.misc import set_random_seed
 from libs.models.DMA import *
 from libs.dataset.MoVe import MoVeDataset
-from libs.dataset.transform import TrainTransform, TestTransform
+from libs.dataset.transform import TrainTransform
 from torch.utils.data import DataLoader
-from libs.utils.optimer import DAN_optimizer
-import numpy as np
 from libs.utils.loss import *
 
 SNAPSHOT_DIR = opt.SNAPSHOT_DIR
@@ -53,9 +54,20 @@ def get_arguments():
     parser.add_argument("--snapshot_dir", type=str, default=SNAPSHOT_DIR)
     parser.add_argument("--save_interval", type=int, default=200, help="Save model every N episodes")
     parser.add_argument("--print_interval", type=int, default=10, help="Print progress every N episodes")
-    parser.add_argument("--ce_loss_weight", type=float, default=5.0, help="Weight for cross entropy loss")
-    parser.add_argument("--iou_loss_weight", type=float, default=1.0, help="Weight for IoU loss")
+    parser.add_argument("--ce_loss_weight", type=float, default=1.0, help="Weight for cross entropy loss")
+    parser.add_argument("--iou_loss_weight", type=float, default=5.0, help="Weight for IoU loss")
+    parser.add_argument("--setting", type=str, default="default", help="default or challenging")
+    parser.add_argument("--resume", action="store_true", help="resume training from checkpoint")
+    parser.add_argument("--warmup_episodes", type=int, default=50, help="Number of warmup episodes")
     return parser.parse_args()
+
+def get_warmup_cosine_schedule_with_warmup(optimizer, warmup_episodes, total_episodes):
+    def lr_lambda(episode):
+        if episode < warmup_episodes:
+            return float(episode) / float(max(1, warmup_episodes))
+        progress = float(episode - warmup_episodes) / float(max(1, total_episodes - warmup_episodes))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    return LambdaLR(optimizer, lr_lambda)
 
 def train():
     args = get_arguments()
@@ -72,24 +84,24 @@ def train():
         os.makedirs(save_dir, exist_ok=True)
         # 使用Tee保存完整的训练日志
         log_file = os.path.join(save_dir, 'train_log.txt')
-        logger = Tee(log_file, 'a')
         
         # 保存完整的参数配置
-        print('='*50)
-        print('Running parameters:')
-        print('='*50)
-        for arg in vars(args):
-            print(f'{arg}: {getattr(args, arg)}')
-        print('='*50)
-        print('\nFull configuration:')
-        print(json.dumps(vars(args), indent=4, separators=(',', ':')))
-        print('='*50 + '\n')
+        with open(log_file, 'a') as f:
+            f.write('='*50 + '\n')
+            f.write('Running parameters:\n') 
+            f.write('='*50 + '\n')
+            for arg in vars(args):
+                f.write(f'{arg}: {getattr(args, arg)}\n')
+            f.write('='*50 + '\n')
+            f.write('\nFull configuration:\n')
+            f.write(json.dumps(vars(args), indent=4, separators=(',', ':')) + '\n')
+            f.write('='*50 + '\n\n')
         
         # Initialize tensorboard writer
         writer = SummaryWriter(os.path.join(save_dir, 'tensorboard'))
 
     # Build model
-    model = DMA()
+    model = DMA(n_way=args.num_ways, k_shot=args.num_shots)
     
     if local_rank == 0:
         print('Total params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
@@ -100,43 +112,43 @@ def train():
     
     # Setup optimizer and gradient scaler for mixed precision training
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.total_episodes, eta_min=1e-6)
+    scheduler = get_warmup_cosine_schedule_with_warmup(optimizer, args.warmup_episodes, args.total_episodes)
     scaler = GradScaler()
 
-    # Try to load latest checkpoint
+    # Try to load latest checkpoint if resume is True
     start_episode = 0
     best_loss = float('inf')
-    checkpoint_pattern = os.path.join(save_dir, 'DAN_MoVe_episode*.pth')
-    checkpoints = glob.glob(checkpoint_pattern)
-    if checkpoints:
-        latest_checkpoint = max(checkpoints, key=os.path.getctime)
-        if local_rank == 0:
-            print(f"Resuming from checkpoint: {latest_checkpoint}")
-        checkpoint = torch.load(latest_checkpoint, map_location=f'cuda:{local_rank}')
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_episode = checkpoint['episode']
-        best_loss = checkpoint['loss']
-        if 'scaler_state_dict' in checkpoint:
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        
-        # Adjust learning rate scheduler
-        for _ in range(start_episode):
-            scheduler.step()
+    if args.resume:
+        checkpoint_pattern = os.path.join(save_dir, 'DAN_MoVe_episode*.pth')
+        checkpoints = glob.glob(checkpoint_pattern)
+        if checkpoints:
+            latest_checkpoint = max(checkpoints, key=os.path.getctime)
+            if local_rank == 0:
+                print(f"Resuming from checkpoint: {latest_checkpoint}")
+            checkpoint = torch.load(latest_checkpoint, map_location=f'cuda:{local_rank}')
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_episode = checkpoint['episode']
+            best_loss = checkpoint['loss']
+            if 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
+            # Adjust learning rate scheduler
+            for _ in range(start_episode):
+                scheduler.step()
 
     # Setup datasets
     size = (241, 425)
-    train_transform = TrainTransform(size)
-    
+    train_transform = TrainTransform(size)    
     train_dataset = MoVeDataset(
-        data_path=opt.root_path,
         train=True,
         group=args.group,
         support_frames=args.support_frames,
         query_frames=args.query_frames,
         num_ways=args.num_ways,
         num_shots=args.num_shots,
-        transforms=train_transform
+        transforms=train_transform,
+        setting=args.setting
     )
     
     train_sampler = DistributedSampler(train_dataset, shuffle=True)
@@ -195,8 +207,7 @@ def train():
             # Forward pass with mixed precision
             with autocast():
                 output = model(query_frames[:, 0], support_frames, support_masks)
-                
-                few_ce_loss, few_iou_loss = criterion(output.flatten(1,2), query_masks.flatten(1,2))
+                few_ce_loss, few_iou_loss = criterion(output.flatten(1, 2), query_masks.flatten(1, 2))
                 total_loss = args.ce_loss_weight * few_ce_loss + args.iou_loss_weight * few_iou_loss
             
             # Backward pass with gradient scaling
@@ -226,7 +237,6 @@ def train():
             
             # Print progress and write to log file
             if local_rank == 0 and (episode + 1) % args.print_interval == 0:
-                avg_loss = total_loss / args.print_interval
                 total_loss = 0
                 
                 time_spent = time.time() - start_time

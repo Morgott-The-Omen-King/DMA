@@ -5,6 +5,8 @@ from torchvision.models import resnet50
 import math
 import einops
 
+from libs.models.DMA.transformers import SelfAttentionLayer, CrossAttentionLayer, FFNLayer
+
 
 class DMA(nn.Module):
     """Decoupled Motion-Appearance Network"""
@@ -86,6 +88,50 @@ class DMA(nn.Module):
         self.decoder = MaskFormerDecoder(self.hidden_dim)
         
         self.mask_head = nn.Conv2d(self.hidden_dim, self.n_way, kernel_size=1)
+        
+        
+        
+        # Q-former
+        self.transformer_self_attention_layers = nn.ModuleList()
+        self.transformer_cross_attention_layers_1 = nn.ModuleList()
+        self.transformer_cross_attention_layers_2 = nn.ModuleList()
+        self.transformer_ffn_layers = nn.ModuleList()
+        self.num_q_former_layers = 6
+        for _ in range(self.num_q_former_layers):
+            self.transformer_cross_attention_layers_1.append(
+                CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=8,
+                    dropout=0.0,
+                    normalize_before=False,
+                )
+            )
+            self.transformer_self_attention_layers.append(
+                SelfAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=8,
+                    dropout=0.0,
+                    normalize_before=False,
+                )
+            )
+            self.transformer_cross_attention_layers_2.append(
+                CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=8,
+                    dropout=0.0,
+                    normalize_before=False,
+                )
+            )
+            self.transformer_ffn_layers.append(
+                FFNLayer(
+                    d_model=hidden_dim,
+                    dim_feedforward=self.hidden_dim*2,
+                    dropout=0.0,
+                    normalize_before=False,
+                )
+            )
+        
+        
 
         # Initialize weights
         self.init_weights()
@@ -197,26 +243,9 @@ class DMA(nn.Module):
         
         # Step 1: 特征提取
         # Query视频特征
-        query_feats = self.extract_features(query_video.reshape(B*T, C, H, W), mask_feats=True)  # todo:这个地方可能需要提取多尺度的特征
+        query_feats = self.extract_features(query_video.reshape(B*T, C, H, W), mask_feats=True)
         
         query_mask_feats, query_feats = query_feats['mask_feats'], query_feats['mask_feats']
-        
-        feat_h, feat_w = query_mask_feats.shape[-2:]
-        # # Convert query mask features to n-way classification mask
-        # query_mask_feats = query_mask_feats.view(B*T, self.hidden_dim, feat_h, feat_w)
-        # query_mask_logits = self.mask_head(query_mask_feats)  # Convert to n-way logits
-        # query_mask_logits = query_mask_logits.view(B, T, self.n_way, feat_h, feat_w)
-        
-        # # Upsample to original resolution
-        # query_mask_logits = F.interpolate(
-        #     query_mask_logits.view(B*T, self.n_way, feat_h, feat_w),
-        #     size=(H, W),
-        #     mode='bilinear',
-        #     align_corners=False
-        # )
-        # query_mask_logits = query_mask_logits.view(B, T, self.n_way, H, W).sigmoid()
-        # query_mask_logits = query_mask_logits.permute(0,2,1,3,4)
-        # return query_mask_logits
         
         
         feat_h, feat_w = query_feats.shape[-2:]  # 获取特征图的实际高宽
@@ -224,7 +253,7 @@ class DMA(nn.Module):
         
         # Support视频特征
         support_feats = self.extract_features(support_video.view(-1, C, H, W), mask_feats=True)
-        support_mask_feats, support_feats = support_feats['mask_feats'], support_feats['mask_feats']
+        support_mask_feats, support_feats = support_feats['mask_feats'], support_feats['mask_feats']  # bs*n_way*k_shot*num_support_frames, feat_dim, feat_h, feat_w
         support_feats = support_feats.view(B, self.n_way, self.k_shot, self.num_support_frames, self.feat_dim, feat_h, feat_w)
         # 提取对应的support对应的appearance feat以及motion feat
         # 1. 提取使用mask pooling得到对应前景特帧，这个表示物体的appearance 特征
@@ -242,8 +271,8 @@ class DMA(nn.Module):
         masked_feats = support_feats_flat * support_mask_resized
         
         # 使用全局平均池化将特征压缩为向量
-        masked_feats = F.adaptive_avg_pool2d(masked_feats, 1).squeeze(-1).squeeze(-1)
-        appearance_feats = masked_feats.view(B, self.n_way, self.k_shot, self.num_support_frames, self.feat_dim)
+        masked_feats = F.adaptive_avg_pool2d(masked_feats, 1).squeeze(-1).squeeze(-1)  # (B*n_way*k_shot*num_support_frames, feat_dim)
+        appearance_feats = masked_feats.view(B, self.n_way, self.k_shot, self.num_support_frames, self.feat_dim)  # (B, n_way, k_shot, num_support_frames, feat_dim)
         
         # 2. 计算相邻帧之间的差异得到motion特征
         # 使用切片并行计算相邻帧差异
@@ -274,8 +303,8 @@ class DMA(nn.Module):
         # support_appearance_feats: (k_shot * num_support, b*n_way, c)
         # 1. 准备输入数据
         # 将motion和appearance特征展平并拼接
-        motion_feats = motion_feats.view(B * self.n_way, self.k_shot * self.num_support_frames, self.hidden_dim).permute(1, 0, 2)
-        appearance_feats = appearance_feats.view(B * self.n_way, self.k_shot * self.num_support_frames, self.hidden_dim).permute(1, 0, 2)
+        motion_feats = motion_feats.view(B * self.n_way, self.k_shot * self.num_support_frames, self.hidden_dim).permute(1, 0, 2)  # (k_shot*num_support_frames, B*n_way, hidden_dim)
+        appearance_feats = appearance_feats.view(B * self.n_way, self.k_shot * self.num_support_frames, self.hidden_dim).permute(1, 0, 2)  # (k_shot*num_support_frames, B*n_way, hidden_dim)
         
         # 2. 添加位置编码
         # 时间位置编码
@@ -289,43 +318,26 @@ class DMA(nn.Module):
         # 合并位置编码
         pos_embed = time_pos_embed + shot_pos_embed
         pos_embed = pos_embed.unsqueeze(1)
+        pos_embed = pos_embed.repeat(1, B * self.n_way, 1)
         
         # 3. 初始化meta-motion queries
         meta_motion_queries = self.meta_motion_queries.expand(B * self.n_way, -1, -1)
         query_pos_embed = self.query_pos_embed.expand(B * self.n_way, -1, -1)
         
+        
+        # new
+        meta_motion_queries = meta_motion_queries.permute(1, 0, 2)
+        query_pos_embed = query_pos_embed.permute(1, 0, 2)
+        
+        # motion_feats = motion_feats.permute(1, 0, 2)
+        # appearance_feats = appearance_feats.permute(1, 0, 2)
+        
         # 4. Q-Former前向传播
-        for layer in self.motion_transformer:  # 遍历6层Transformer
-            # 获取当前层的各个模块
-            cross_attn1, norm1, cross_attn2, norm2, self_attn, norm3, ffn, norm4 = layer
-            
-            # 第一层Cross-attention: 与motion特征交互
-            motion_attn = cross_attn1(
-                meta_motion_queries + query_pos_embed,
-                motion_feats + pos_embed,
-                motion_feats + pos_embed
-            )
-            motion_attn = norm1(motion_attn)
-            
-            # 第二层Cross-attention: 与appearance特征交互
-            appear_attn = cross_attn2(
-                motion_attn + query_pos_embed,
-                appearance_feats + pos_embed,
-                appearance_feats + pos_embed
-            )
-            appear_attn = norm2(appear_attn)
-            
-            # Self-attention: meta-motion queries自身交互
-            meta_motion_queries = self_attn(
-                appear_attn + query_pos_embed,
-                appear_attn + query_pos_embed,
-                appear_attn + query_pos_embed
-            )
-            meta_motion_queries = norm3(meta_motion_queries)
-            
-            # FFN
-            meta_motion_queries = ffn(meta_motion_queries)
-            meta_motion_queries = norm4(meta_motion_queries)
+        for i in range(self.num_q_former_layers):
+            meta_motion_queries = self.transformer_cross_attention_layers_1[i](meta_motion_queries, motion_feats, pos=pos_embed, query_pos=query_pos_embed)
+            meta_motion_queries = self.transformer_self_attention_layers[i](meta_motion_queries, tgt_mask=None, tgt_key_padding_mask=None, query_pos=query_pos_embed)
+            meta_motion_queries = self.transformer_cross_attention_layers_2[i](meta_motion_queries, appearance_feats, pos=pos_embed, query_pos=query_pos_embed)
+            meta_motion_queries = self.transformer_ffn_layers[i](meta_motion_queries)
         
         # 5. 获取meta-motion prototype
         meta_motion_prototype = meta_motion_queries.view(B, self.n_way, self.num_meta_motion_queries, self.hidden_dim)
@@ -405,7 +417,7 @@ class MaskFormerDecoder(nn.Module):
             masks: (B, K, T, H, W)
         """
         B, T, C, H, W = img_feats.shape
-        query_feats = query_feats.transpose(0, 1)  # N, B*K, C
+        # query_feats = query_feats.transpose(0, 1)  # N, B*K, C
         N, BK, _ = query_feats.shape
         
         K = BK // B  # n_way
