@@ -3,23 +3,7 @@
 # @Author  : Haoxin Chen
 # @File    : loss.py
 import torch
-def mask_iou(pred, target):
 
-    """
-    param: pred of size [N x H x W]
-    param: target of size [N x H x W]
-    """
-
-    assert len(pred.shape) == 3 and pred.shape == target.shape
-
-    N = pred.size(0)
-
-    inter = torch.min(pred, target).sum(2).sum(1)
-    union = torch.max(pred, target).sum(2).sum(1)
-
-    iou = torch.sum(inter / union) / N
-
-    return iou
 
 def binary_entropy_loss(pred, target, eps=0.001):
 
@@ -57,6 +41,27 @@ def cross_entropy_loss(pred, target, bootstrap=0.4, eps=0.001,weight=1):
     loss = torch.mean(mloss[:,:, :num])
 
     return loss
+
+
+def mask_iou(pred, target):
+
+    """
+    param: pred of size [N x H x W]
+    param: target of size [N x H x W]
+    """
+
+    assert len(pred.shape) == 3 and pred.shape == target.shape
+
+    N = pred.size(0)
+
+    inter = torch.min(pred, target).sum(2).sum(1)
+    # if inter.sum() > 0:
+    #     print(inter.sum().item(), pred.sum().item(), target.sum().item())
+    union = torch.max(pred, target).sum(2).sum(1)
+
+    iou = torch.sum(inter / (union + 1e-10)) / N
+
+    return iou
 
 def mask_iou_loss(pred, mask):
 

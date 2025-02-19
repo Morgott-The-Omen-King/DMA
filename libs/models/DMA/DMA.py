@@ -354,9 +354,7 @@ class DMA(nn.Module):
         query_mask_feats = query_mask_feats.view(B, T, *query_mask_feats.shape[1:])
         mask = self.decoder(query_mask_feats, meta_motion_queries)  # B, N_way, T, H, W
         
-        resize_mask = F.interpolate(mask.flatten(0,1), size=(H, W), mode='bilinear', align_corners=False).view(B, self.n_way, T, H, W).sigmoid()  # B n t h w
-        
-        return resize_mask
+        return mask
 
 
 class MultiHeadAttention(nn.Module):

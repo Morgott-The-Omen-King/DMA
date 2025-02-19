@@ -23,6 +23,7 @@ from libs.dataset.MoVe import MoVeDataset
 from libs.dataset.transform import TrainTransform
 from torch.utils.data import DataLoader
 from libs.utils.loss import *
+from libs.models.DMA.loss import build_criterion
 
 SNAPSHOT_DIR = opt.SNAPSHOT_DIR
 
@@ -55,10 +56,11 @@ def get_arguments():
     parser.add_argument("--save_interval", type=int, default=200, help="Save model every N episodes")
     parser.add_argument("--print_interval", type=int, default=10, help="Print progress every N episodes")
     parser.add_argument("--ce_loss_weight", type=float, default=1.0, help="Weight for cross entropy loss")
-    parser.add_argument("--iou_loss_weight", type=float, default=5.0, help="Weight for IoU loss")
+    parser.add_argument("--iou_loss_weight", type=float, default=1.0, help="Weight for IoU loss")
     parser.add_argument("--setting", type=str, default="default", help="default or challenging")
     parser.add_argument("--resume", action="store_true", help="resume training from checkpoint")
     parser.add_argument("--warmup_episodes", type=int, default=50, help="Number of warmup episodes")
+    parser.add_argument("--loss_type", type=str, default="default", help="default or mask2former")
     return parser.parse_args()
 
 def get_warmup_cosine_schedule_with_warmup(optimizer, warmup_episodes, total_episodes):
@@ -172,8 +174,7 @@ def train():
     moving_ce_loss = 0
     moving_iou_loss = 0
 
-    celoss = cross_entropy_loss
-    criterion = lambda pred, target, bootstrap=1: [celoss(pred, target, bootstrap), mask_iou_loss(pred, target)]
+    criterion = build_criterion(args.loss_type)
     
     # 创建loss记录器
     loss_recorder = Loss_record()

@@ -64,3 +64,5 @@ scripts/
 
 data
 pretrain_model
+_torchshow
+snapshots

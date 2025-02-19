@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port=29512 train_MoVe_DMA.py --snapshot_dir snapshots/DMA/default/resnet/2-way-1-shot/ --group 0 --num_ways 2 --num_shots 1 --total_episodes 15000 --setting default
