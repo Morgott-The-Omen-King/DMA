@@ -211,8 +211,8 @@ def train():
                 output = model(query_frames[:, 0], support_frames, support_masks)  # B, N_way, T, H, W
                 if args.loss_type == 'default':
                     output = F.interpolate(output.view(-1, 1, *output.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=False)
-                output = output.view(B, args.num_ways, -1, 1, 241, 425)  # Reshape back to [B, N_way, T, 1, 241, 425]
-                output = output[:, :, :, 0, :, :]
+                    output = output.view(B, args.num_ways, -1, 1, 241, 425)  # Reshape back to [B, N_way, T, 1, 241, 425]
+                    output = output[:, :, :, 0, :, :]
                 few_ce_loss, few_iou_loss = criterion(output.flatten(1, 2), query_masks.flatten(1, 2))
                 total_loss = args.ce_loss_weight * few_ce_loss + args.iou_loss_weight * few_iou_loss
             
