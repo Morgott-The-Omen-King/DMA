@@ -5,7 +5,7 @@ from torchvision.models import resnet50
 import math
 import einops
 
-from libs.models.DMA.transformers import SelfAttentionLayer, CrossAttentionLayer, FFNLayer
+from libs.models.DMA.transformers import SelfAttentionLayer, CrossAttentionLayer, FFNLayer, PositionEmbeddingSine3D
 
 
 class DMA(nn.Module):
@@ -295,7 +295,6 @@ class DMA(nn.Module):
         # 不同shot的motion_feats和appearance_feats要concat在一起，但是在做attention的时候一定要加上合适的位置编码（时间位置编码以及对应shot的位置编码，让模型知道这是不同的shot）
         # 为每个way单独提取meta-motion prototype
         
-        
         # 我这里在具体一点
         # 输入到Q-former中（q-former层数为6）
         # meta_motion_queries: (num_meta_motion_queries, b*n_way, c)
@@ -324,7 +323,6 @@ class DMA(nn.Module):
         meta_motion_queries = self.meta_motion_queries.expand(B * self.n_way, -1, -1)
         query_pos_embed = self.query_pos_embed.expand(B * self.n_way, -1, -1)
         
-        
         # new
         meta_motion_queries = meta_motion_queries.permute(1, 0, 2)
         query_pos_embed = query_pos_embed.permute(1, 0, 2)
@@ -352,7 +350,7 @@ class DMA(nn.Module):
         # query_feats = self.query_proj(query_feats)
         # query_feats = query_feats.view(B, T, *query_feats.shape[1:])
         query_mask_feats = query_mask_feats.view(B, T, *query_mask_feats.shape[1:])
-        mask = self.decoder(query_mask_feats, meta_motion_queries)  # B, N_way, T, H, W
+        mask = self.decoder(query_mask_feats, meta_motion_queries, query_pos_embed)  # B, N_way, T, H, W
         
         return mask
 
@@ -390,13 +388,37 @@ class MaskFormerDecoder(nn.Module):
         self.num_heads = 8
         self.num_layers = 6
         
-        # 多层transformer decoder
-        self.transformer_layers = nn.ModuleList([
-            TransformerDecoderLayer(
-                d_model=self.hidden_dim,
-                nhead=self.num_heads
-            ) for _ in range(self.num_layers)
-        ])
+        self.transformer_cross_attention_layers = nn.ModuleList()
+        self.transformer_self_attention_layers = nn.ModuleList()
+        self.transformer_ffn_layers = nn.ModuleList()
+        
+        for _ in range(self.num_layers):
+            self.transformer_cross_attention_layers.append(
+                CrossAttentionLayer(
+                    d_model=256,
+                    nhead=8,
+                    dropout=0.0,
+                    normalize_before=False,
+                )
+            )
+            self.transformer_self_attention_layers.append(
+                SelfAttentionLayer(
+                    d_model=256,
+                    nhead=8,
+                    dropout=0.0,
+                    normalize_before=False,
+                )
+            )
+            self.transformer_ffn_layers.append(
+                FFNLayer(
+                    d_model=256,
+                    dim_feedforward=256*2,
+                    dropout=0.0,
+                    normalize_before=False,
+                )
+            )
+        
+        self.pe_layer = PositionEmbeddingSine3D(self.hidden_dim // 2, normalize=True)
         
         # 预测mask的MLP头
         self.mask_embed = MLP(
@@ -405,8 +427,9 @@ class MaskFormerDecoder(nn.Module):
             output_dim=self.hidden_dim,
             num_layers=2
         )
+    
         
-    def forward(self, img_feats, query_feats):
+    def forward(self, img_feats, query_feats, query_pos_embed):
         """
         Args:
             img_feats: (B, T, C, H, W)
@@ -425,16 +448,22 @@ class MaskFormerDecoder(nn.Module):
         
         # 将空间维度展平作为序列
         # img_feats = img_feats.flatten(2).permute(2, 0, 1)  # (HW, B, C)
+        img_pe = self.pe_layer(img_feats)
+        img_pe = img_pe.unsqueeze(1).repeat(1, K, 1, 1, 1, 1)  # (B, N, T, C, H, W)
+        img_pe = einops.rearrange(img_pe, 'b k t c h w -> (t h w) (b k) c')  # (T*H*W, B*K, C)
+        
         img_feats = img_feats.unsqueeze(1).repeat(1, K, 1, 1, 1, 1)  # (B, N, T, C, H, W)
         img_feats = einops.rearrange(img_feats, 'b k t c h w -> (t h w) (b k) c')  # (T*H*W, B*K, C)
-    
         
         # 通过transformer layers
         tgt = query_feats  # (N, B*K, C)
         memory = img_feats  # (T*H*W, B*K, C)
+        memory_pe = img_pe  # (T*H*W, B*K, C)
         
-        for layer in self.transformer_layers:
-            tgt = layer(tgt, memory)  # (N, B*K, C)
+        for i in range(self.num_layers):
+            tgt = self.transformer_cross_attention_layers[i](tgt, memory, pos=memory_pe, query_pos=query_pos_embed)  # (N, B*K, C)
+            tgt = self.transformer_self_attention_layers[i](tgt, tgt_mask=None, tgt_key_padding_mask=None, query_pos=query_pos_embed)
+            tgt = self.transformer_ffn_layers[i](tgt)
         
         # 生成mask嵌入
         mask_embed = self.mask_embed(tgt)  # (N, B*K, C)
@@ -458,49 +487,7 @@ class MaskFormerDecoder(nn.Module):
         masks = masks.sum(dim=2)  # (B, K, T, H, W)
         
         return masks
-
-class TransformerDecoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
-        super().__init__()
-        
-        # 多头自注意力
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        # 多头交叉注意力
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        
-        # 前馈网络
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        
-        # Layer Norm
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
-        
-        self.activation = nn.ReLU()
-        
-    def forward(self, tgt, memory):
-        # 自注意力
-        tgt2 = self.self_attn(tgt, tgt, tgt)[0]
-        tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
-        
-        # 交叉注意力
-        tgt2 = self.multihead_attn(tgt, memory, memory)[0]
-        tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
-        
-        # 前馈网络
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
-        tgt = tgt + self.dropout3(tgt2)
-        tgt = self.norm3(tgt)
-        
-        return tgt
+    
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
