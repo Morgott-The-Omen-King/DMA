@@ -14,6 +14,7 @@ import glob
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import LambdaLR
+import torch.nn.functional as F
 
 from libs.config.DAN_config import OPTION as opt
 from libs.utils.Logger import TreeEvaluation as Tee, Loss_record
@@ -185,14 +186,14 @@ def train():
             
         try:
             # 转换数据格式
-            _, _, C, H, W = query_frames.shape
+            B, _, C, H, W = query_frames.shape
             query_frames = query_frames.view(args.batch_size, args.num_ways, -1, C, H, W)
             query_masks = query_masks.view(args.batch_size, args.num_ways, -1, H, W)
             
-            F = args.support_frames
+            supp_F = args.support_frames
             K = args.num_shots
-            support_frames = support_frames.view(args.batch_size, args.num_ways, K, F, C, H, W)
-            support_masks = support_masks.view(args.batch_size, args.num_ways, K, F, H, W)
+            support_frames = support_frames.view(args.batch_size, args.num_ways, K, supp_F, C, H, W)
+            support_masks = support_masks.view(args.batch_size, args.num_ways, K, supp_F, H, W)
             
             # 移动数据到GPU
             query_frames = query_frames.cuda(local_rank, non_blocking=True)
@@ -207,7 +208,11 @@ def train():
             
             # Forward pass with mixed precision
             with autocast():
-                output = model(query_frames[:, 0], support_frames, support_masks)
+                output = model(query_frames[:, 0], support_frames, support_masks)  # B, N_way, T, H, W
+                if args.loss_type == 'default':
+                    output = F.interpolate(output.view(-1, 1, *output.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=False)
+                output = output.view(B, args.num_ways, -1, 1, 241, 425)  # Reshape back to [B, N_way, T, 1, 241, 425]
+                output = output[:, :, :, 0, :, :]
                 few_ce_loss, few_iou_loss = criterion(output.flatten(1, 2), query_masks.flatten(1, 2))
                 total_loss = args.ce_loss_weight * few_ce_loss + args.iou_loss_weight * few_iou_loss
             
@@ -256,9 +261,22 @@ def train():
             
             # Save checkpoint
             if local_rank == 0 and (episode + 1) % args.save_interval == 0:
+                # Save latest checkpoint
+                latest_checkpoint_path = os.path.join(save_dir, 'latest_checkpoint.pth')
+                torch.save({
+                    'episode': episode + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(), 
+                    'scaler_state_dict': scaler.state_dict(),
+                    'loss': moving_loss,
+                    'args': args,
+                }, latest_checkpoint_path)
+                print(f"Saved latest checkpoint at episode {episode+1}")
+
+                # Save best checkpoint if current loss is better
                 if moving_loss < best_loss:
                     best_loss = moving_loss
-                    checkpoint_path = os.path.join(save_dir, f'DAN_MoVe_episode{episode+1}_loss{moving_loss:.4f}.pth')
+                    best_checkpoint_path = os.path.join(save_dir, f'DAN_MoVe_episode{episode+1}_loss{moving_loss:.4f}.pth')
                     torch.save({
                         'episode': episode + 1,
                         'model_state_dict': model.state_dict(),
@@ -266,8 +284,8 @@ def train():
                         'scaler_state_dict': scaler.state_dict(),
                         'loss': best_loss,
                         'args': args,
-                    }, checkpoint_path)
-                    print(f"Saved checkpoint at episode {episode+1}")
+                    }, best_checkpoint_path)
+                    print(f"Saved best checkpoint at episode {episode+1} with loss {moving_loss:.4f}")
             
             # Synchronize processes
             dist.barrier()
