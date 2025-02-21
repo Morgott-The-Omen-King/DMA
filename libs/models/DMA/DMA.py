@@ -6,65 +6,30 @@ import math
 import einops
 
 from libs.models.DMA.transformers import SelfAttentionLayer, CrossAttentionLayer, FFNLayer, PositionEmbeddingSine3D
+from libs.models.DAN.resnet import resnet50
+
+from detectron2.layers.shape_spec import ShapeSpec
+from libs.models.DMA.msdeformattn import MSDeformAttnPixelDecoder
 
 
 class DMA(nn.Module):
     """Decoupled Motion-Appearance Network"""
     def __init__(self, 
-                 n_way=2, 
+                 n_way=1, 
                  k_shot=1, 
                  num_support_frames=5, 
+                 num_meta_motion_queries=20,
                  backbone='resnet50',
                  hidden_dim=256):
         super().__init__()
         self.n_way = n_way
         self.k_shot = k_shot
         self.num_support_frames = num_support_frames
-        
-        # q-former
-        self.num_meta_motion_queries = 20
     
         self.build_backbone()
             
         # 特征维度
         self.hidden_dim = hidden_dim
-        
-        # Motion-Appearance解耦模块
-        self.motion_encoder = nn.Sequential(
-            nn.Conv3d(self.feat_dim, self.hidden_dim, kernel_size=(3,1,1), padding=(1,0,0)),
-            nn.BatchNorm3d(self.hidden_dim),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.appear_encoder = nn.Sequential(
-            nn.Conv2d(self.feat_dim, self.hidden_dim, 1),
-            nn.BatchNorm2d(self.hidden_dim),
-            nn.ReLU(inplace=True)
-        )
-            
-        # Q-Former风格的动作分解模块
-        # Meta-motion queries
-        self.meta_motion_queries = nn.Parameter(torch.zeros(1, self.num_meta_motion_queries, self.hidden_dim))
-        self.query_pos_embed = nn.Parameter(torch.zeros(1, self.num_meta_motion_queries, self.hidden_dim))
-        
-        # 定义多层Transformer结构
-        self.motion_transformer = nn.ModuleList([
-            nn.Sequential(
-                MultiHeadAttention(self.hidden_dim),  # Cross-attention 1
-                nn.LayerNorm(self.hidden_dim),
-                MultiHeadAttention(self.hidden_dim),  # Cross-attention 2
-                nn.LayerNorm(self.hidden_dim),
-                MultiHeadAttention(self.hidden_dim),  # Self-attention
-                nn.LayerNorm(self.hidden_dim),
-                nn.Sequential(  # FFN
-                    nn.Linear(self.hidden_dim, self.hidden_dim * 4),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(self.hidden_dim * 4, self.hidden_dim)
-                ),
-                nn.LayerNorm(self.hidden_dim)
-            )
-            for _ in range(6)  # 6层
-        ])
         
         # mask_feats head
         # 1x1 convolutions for adjusting channel dimensions
@@ -78,20 +43,30 @@ class DMA(nn.Module):
             nn.ReLU(inplace=True)
         )
         
+        # ========================================================
+        # Motion-Appearance解耦模块
+        self.motion_encoder = nn.Sequential(
+            nn.Conv3d(self.feat_dim, self.hidden_dim, kernel_size=(3,1,1), padding=(1,0,0)),
+            nn.BatchNorm3d(self.hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.appear_encoder = nn.Sequential(
+            nn.Conv2d(self.feat_dim, self.hidden_dim, 1),
+            nn.BatchNorm2d(self.hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+        
         # 特征映射层
         self.motion_proj = nn.Linear(self.feat_dim, self.hidden_dim)
         self.appear_proj = nn.Linear(self.feat_dim, self.hidden_dim)
         
-        self.query_proj = nn.Conv2d(self.feat_dim, self.hidden_dim, kernel_size=1)
+        # ========================================================
+        # q-former
+        self.num_meta_motion_queries = num_meta_motion_queries
+        self.meta_motion_queries = nn.Embedding(self.num_meta_motion_queries, self.hidden_dim)
+        self.query_pos_embed = nn.Embedding(self.num_meta_motion_queries, self.hidden_dim)
         
-        # 分割头
-        self.decoder = MaskFormerDecoder(self.hidden_dim)
-        
-        self.mask_head = nn.Conv2d(self.hidden_dim, self.n_way, kernel_size=1)
-        
-        
-        
-        # Q-former
         self.transformer_self_attention_layers = nn.ModuleList()
         self.transformer_cross_attention_layers_1 = nn.ModuleList()
         self.transformer_cross_attention_layers_2 = nn.ModuleList()
@@ -131,8 +106,13 @@ class DMA(nn.Module):
                 )
             )
         
-        
+        # 分割头
+        self.decoder = MaskFormerDecoder(self.hidden_dim)
 
+        self.mask_head = nn.Conv2d(self.hidden_dim, self.n_way, kernel_size=1)
+        
+        self.pixel_decoder = PixelDecoder()
+        
         # Initialize weights
         self.init_weights()
     
@@ -148,8 +128,8 @@ class DMA(nn.Module):
                 nn.init.constant_(m.bias, 0)
                 
         # Special initialization for meta motion queries and positional embeddings
-        nn.init.normal_(self.meta_motion_queries, std=0.02)
-        nn.init.normal_(self.query_pos_embed, std=0.02)
+        nn.init.normal_(self.meta_motion_queries.weight, std=0.02)
+        nn.init.normal_(self.query_pos_embed.weight, std=0.02)
     
     @property
     def device(self):
@@ -161,7 +141,9 @@ class DMA(nn.Module):
         backbone = resnet50(pretrained=True)
         
         # 获取不同层的特征
-        self.layer1 = nn.Sequential(*list(backbone.children())[:5])  # 1/4
+        self.layer0 = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu1, backbone.conv2, backbone.bn2, backbone.relu2,
+                                    backbone.conv3, backbone.bn3, backbone.relu3, backbone.maxpool)
+        self.layer1 = backbone.layer1  # 1/4
         self.layer2 = backbone.layer2  # 1/8 
         self.layer3 = backbone.layer3  # 1/16
         self.layer4 = backbone.layer4  # 1/32
@@ -179,39 +161,48 @@ class DMA(nn.Module):
     def extract_features(self, rgb_input, mask_feats=False):
         """使用骨干网络提取多尺度特征"""
         # 提取多尺度特征
-        feat_1_4 = self.layer1(rgb_input)
+        feat_1_4 = self.layer1(self.layer0(rgb_input))
         feat_1_8 = self.layer2(feat_1_4)
         feat_1_16 = self.layer3(feat_1_8)
         feat_1_32 = self.layer4(feat_1_16)
         
         # 返回多尺度特征字典
         features = {
-            'layer1': feat_1_4,
-            'layer2': feat_1_8,
-            'layer3': feat_1_16,
-            'layer4': feat_1_32
+            'res2': feat_1_4,
+            'res3': feat_1_8,
+            'res4': feat_1_16,
+            'res5': feat_1_32,
         }
         
         if mask_feats:
-            # 将layer2和layer3上采样到layer1尺度
-            feat_1_8_up = F.interpolate(
-                self.layer2_conv(feat_1_8),  # 1x1 conv to adjust channels
-                size=feat_1_4.shape[-2:],
-                mode='bilinear',
-                align_corners=False
-            )
+            # permute 为 B H W C
+            mask_feats, _, ms_feats = self.pixel_decoder(features)
+        
+        # if mask_feats:
+        #     # 将layer2和layer3上采样到layer1尺度
+        #     # First level: layer3 -> layer2
+        #     feat_1_16_to_1_8 = F.interpolate(
+        #         self.layer3_conv(feat_1_16),
+        #         size=feat_1_8.shape[-2:],
+        #         mode='bilinear',
+        #         align_corners=False
+        #     )
+        #     feat_1_8_fused = self.layer2_conv(feat_1_8) + feat_1_16_to_1_8
+
+        #     # Second level: fused layer2 -> layer1 
+        #     feat_1_8_to_1_4 = F.interpolate(
+        #         feat_1_8_fused,
+        #         size=feat_1_4.shape[-2:], 
+        #         mode='bilinear',
+        #         align_corners=False
+        #     )
             
-            feat_1_16_up = F.interpolate(
-                self.layer3_conv(feat_1_16),  # 1x1 conv to adjust channels 
-                size=feat_1_4.shape[-2:],
-                mode='bilinear',
-                align_corners=False
-            )
-            
-            # 将多尺度特征相加并通过1x1卷积融合
-            mask_feats = self.fusion_conv(feat_1_4 + feat_1_8_up + feat_1_16_up)
-            features['mask_feats'] = mask_feats
-            
+        #     # Final fusion with layer1 features
+        #     mask_feats = self.fusion_conv(feat_1_4 + feat_1_8_to_1_4)
+        #     features['mask_feats'] = mask_feats
+        features['mask_feats'] = mask_feats
+        features['ms_feats'] = ms_feats
+        
         return features
     
     def get_sinusoid_encoding(self, time_pos, d_hid):
@@ -268,10 +259,12 @@ class DMA(nn.Module):
         )
         
         support_feats_flat = support_feats.view(-1, self.feat_dim, feat_h, feat_w)
-        masked_feats = support_feats_flat * support_mask_resized
         
-        # 使用全局平均池化将特征压缩为向量
-        masked_feats = F.adaptive_avg_pool2d(masked_feats, 1).squeeze(-1).squeeze(-1)  # (B*n_way*k_shot*num_support_frames, feat_dim)
+        # 计算前景区域的平均值
+        masked_feats = support_feats_flat * support_mask_resized
+        mask_sum = support_mask_resized.sum(dim=(2,3), keepdim=True) + 1e-6
+        masked_feats = (masked_feats.sum(dim=(2,3), keepdim=True) / mask_sum).squeeze(-1).squeeze(-1)
+        
         appearance_feats = masked_feats.view(B, self.n_way, self.k_shot, self.num_support_frames, self.feat_dim)  # (B, n_way, k_shot, num_support_frames, feat_dim)
         
         # 2. 计算相邻帧之间的差异得到motion特征
@@ -320,12 +313,9 @@ class DMA(nn.Module):
         pos_embed = pos_embed.repeat(1, B * self.n_way, 1)
         
         # 3. 初始化meta-motion queries
-        meta_motion_queries = self.meta_motion_queries.expand(B * self.n_way, -1, -1)
-        query_pos_embed = self.query_pos_embed.expand(B * self.n_way, -1, -1)
+        meta_motion_queries = self.meta_motion_queries.weight.unsqueeze(1).repeat(1, B * self.n_way, 1)
+        query_pos_embed = self.query_pos_embed.weight.unsqueeze(1).repeat(1, B * self.n_way, 1)
         
-        # new
-        meta_motion_queries = meta_motion_queries.permute(1, 0, 2)
-        query_pos_embed = query_pos_embed.permute(1, 0, 2)
         
         # motion_feats = motion_feats.permute(1, 0, 2)
         # appearance_feats = appearance_feats.permute(1, 0, 2)
@@ -336,9 +326,6 @@ class DMA(nn.Module):
             meta_motion_queries = self.transformer_self_attention_layers[i](meta_motion_queries, tgt_mask=None, tgt_key_padding_mask=None, query_pos=query_pos_embed)
             meta_motion_queries = self.transformer_cross_attention_layers_2[i](meta_motion_queries, appearance_feats, pos=pos_embed, query_pos=query_pos_embed)
             meta_motion_queries = self.transformer_ffn_layers[i](meta_motion_queries)
-        
-        # 5. 获取meta-motion prototype
-        meta_motion_prototype = meta_motion_queries.view(B, self.n_way, self.num_meta_motion_queries, self.hidden_dim)
         
         # 最后阶段，使用对应的mask_head
         # 利用类似mask2former中的mask_head结构
@@ -353,31 +340,6 @@ class DMA(nn.Module):
         mask = self.decoder(query_mask_feats, meta_motion_queries, query_pos_embed)  # B, N_way, T, H, W
         
         return mask
-
-
-class MultiHeadAttention(nn.Module):
-    """多头注意力模块"""
-    def __init__(self, dim, num_heads=8):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-        
-    def forward(self, q, k, v):
-        B, N, C = q.shape
-        
-        qkv = self.qkv(q).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        return x
 
 
 class MaskFormerDecoder(nn.Module):
@@ -419,6 +381,7 @@ class MaskFormerDecoder(nn.Module):
             )
         
         self.pe_layer = PositionEmbeddingSine3D(self.hidden_dim // 2, normalize=True)
+        self.decoder_norm = nn.LayerNorm(self.hidden_dim)
         
         # 预测mask的MLP头
         self.mask_embed = MLP(
@@ -462,10 +425,11 @@ class MaskFormerDecoder(nn.Module):
         
         for i in range(self.num_layers):
             tgt = self.transformer_cross_attention_layers[i](tgt, memory, pos=memory_pe, query_pos=query_pos_embed)  # (N, B*K, C)
-            tgt = self.transformer_self_attention_layers[i](tgt, tgt_mask=None, tgt_key_padding_mask=None, query_pos=query_pos_embed)
+            tgt = self.transformer_self_attention_layers[i](tgt, query_pos=query_pos_embed)
             tgt = self.transformer_ffn_layers[i](tgt)
         
         # 生成mask嵌入
+        tgt = self.decoder_norm(tgt)
         mask_embed = self.mask_embed(tgt)  # (N, B*K, C)
         
         # 重塑为最终输出格式
@@ -473,15 +437,15 @@ class MaskFormerDecoder(nn.Module):
         mask_embed = mask_embed.permute(1, 2, 0, 3)  # (B, K, N, C)
         
         # 重塑图像特征
-        img_feats = img_feats.permute(1, 2, 0)  # (B*K, C, T*H*W)
+        img_feats = img_feats.permute(1, 2, 0)       # (B*K, C, T*H*W)
         img_feats = img_feats.view(B, K, C, T, H*W)  # (B, K, C, T, H*W)
-        img_feats = img_feats.permute(0, 1, 3, 2, 4)  # (B, T, C, H*W)
+        img_feats = img_feats.permute(0, 1, 3, 2, 4) # (B, K, T, C, H*W)
         
         # 扩展mask_embed以匹配时序维度
         
         # 计算相似度得到mask
         masks = torch.einsum('bktcl,bknc->bkntl', img_feats, mask_embed)
-        masks = masks.view(B, K, N, T, H, W) 
+        masks = masks.view(B, K, N, T, H, W)
         
         # 
         masks = masks.sum(dim=2)  # (B, K, T, H, W)
@@ -504,19 +468,60 @@ class MLP(nn.Module):
         return x
 
 
+class PixelDecoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        input_shape = {
+            'res2': ShapeSpec(channels=256, stride=4),
+            'res3': ShapeSpec(channels=512, stride=8),
+            'res4': ShapeSpec(channels=1024, stride=16),
+            'res5': ShapeSpec(channels=2048, stride=32),
+        }
+
+        transformer_dropout = 0.0
+        transformer_nheads = 8
+        transformer_dim_feedforward = 1024
+        transformer_enc_layers = 6
+        conv_dim = 256
+        mask_dim = 256
+        norm = 'GN'
+        transformer_in_features = ['res3', 'res4', 'res5']
+        common_stride = 4
+        
+        self.msdeformattn_pixel_decoder = MSDeformAttnPixelDecoder(
+            input_shape=input_shape,
+            transformer_dropout=transformer_dropout,
+            transformer_nheads=transformer_nheads,
+            transformer_dim_feedforward=transformer_dim_feedforward,
+            transformer_enc_layers=transformer_enc_layers,
+            conv_dim=conv_dim,
+            mask_dim=mask_dim,
+            norm=norm,
+            transformer_in_features=transformer_in_features,
+            common_stride=common_stride,
+        )
+    
+    def forward(self, features):
+        features = self.msdeformattn_pixel_decoder.forward_features(features)
+        return features
+        
+        
+
 # 测试代码
 if __name__ == "__main__":
-    # 创建模型
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DMA(n_way=2, k_shot=1, num_support_frames=10).to(device)
+    # # 创建模型
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # model = DMA(n_way=2, k_shot=1, num_support_frames=10).to(device)
     
-    # 创建测试数据
-    B, T = 2, 16
-    H, W = 241, 425
-    query_video = torch.randn(B, T, 3, H, W).to(device)
-    support_video = torch.randn(B, 2, 1, 10, 3, H, W).to(device)
-    support_mask = torch.randn(B, 2, 1, 10, H, W).to(device)
+    # # 创建测试数据
+    # B, T = 2, 16
+    # H, W = 241, 425
+    # query_video = torch.randn(B, T, 3, H, W).to(device)
+    # support_video = torch.randn(B, 2, 1, 10, 3, H, W).to(device)
+    # support_mask = torch.randn(B, 2, 1, 10, H, W).to(device)
     
-    # 前向传播
-    masks = model(query_video, support_video, support_mask)
-    print("Output masks shape:", masks.shape)
+    # # 前向传播
+    # masks = model(query_video, support_video, support_mask)
+    # print("Output masks shape:", masks.shape)
+    
+    pixel_decoder = PixelDecoder()
