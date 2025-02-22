@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet50
 import math
 import einops
 
@@ -18,6 +17,7 @@ class DMA(nn.Module):
                  n_way=1, 
                  k_shot=1, 
                  num_support_frames=5, 
+                 num_query_frames=1,
                  num_meta_motion_queries=20,
                  backbone='resnet50',
                  hidden_dim=256):
@@ -390,8 +390,26 @@ class MaskFormerDecoder(nn.Module):
             output_dim=self.hidden_dim,
             num_layers=2
         )
-    
-        
+
+    def forward_prediction_heads(self, output, mask_features, attn_mask_target_size):
+        decoder_output = self.decoder_norm(output)
+        decoder_output = decoder_output.transpose(0, 1)
+        outputs_class = self.class_embed(decoder_output)
+        mask_embed = self.mask_embed(decoder_output)
+        outputs_mask = torch.einsum("bqc,btchw->bqthw", mask_embed, mask_features)
+        b, q, t, _, _ = outputs_mask.shape
+
+        # NOTE: prediction is of higher-resolution
+        # [B, Q, T, H, W] -> [B, Q, T*H*W] -> [B, h, Q, T*H*W] -> [B*h, Q, T*HW]
+        attn_mask = F.interpolate(outputs_mask.flatten(0, 1), size=attn_mask_target_size, mode="bilinear", align_corners=False).view(
+            b, q, t, attn_mask_target_size[0], attn_mask_target_size[1])
+        # must use bool type
+        # If a BoolTensor is provided, positions with ``True`` are not allowed to attend while ``False`` values will be unchanged.
+        attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
+        attn_mask = attn_mask.detach()
+
+        return outputs_class, outputs_mask, attn_mask
+
     def forward(self, img_feats, query_feats, query_pos_embed):
         """
         Args:
@@ -446,9 +464,11 @@ class MaskFormerDecoder(nn.Module):
         # 计算相似度得到mask
         masks = torch.einsum('bktcl,bknc->bkntl', img_feats, mask_embed)
         masks = masks.view(B, K, N, T, H, W)
+        masks = masks[:, :, 0, :, :, :]
         
-        # 
-        masks = masks.sum(dim=2)  # (B, K, T, H, W)
+        # # 
+        # masks = masks.sum(dim=2)  # (B, K, T, H, W)
+        # masks = masks.clamp(0, 1)  # 将值截断到0和1之间
         
         return masks
     
