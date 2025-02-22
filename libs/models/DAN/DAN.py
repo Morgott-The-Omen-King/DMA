@@ -91,7 +91,7 @@ class DAN(nn.Module):
         # img flow : [batch, frame, channels, height, width] -> [batch*frame, channels, height, width]
         # support_mask : [batch, sframe, mask_channels, height, width]
         in_f = torch.cat((img,support_image),dim=0)
-        encoder_f,encoder_f_l3,encoder_f_l2,encoder_f_l1 = self.encoder(in_f)
+        encoder_f,encoder_f_l3,encoder_f_l2,encoder_f_l1 = self.encoder(in_f)  # 1/8, 1/8, 1/4
         if time is not None:
             time.t1()
         support_mask = F.interpolate(support_mask, encoder_f.size()[2:], mode='bilinear', align_corners=True)
