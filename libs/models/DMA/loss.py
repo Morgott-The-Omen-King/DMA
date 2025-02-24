@@ -227,7 +227,8 @@ class SimpleMask2FormerCriterion:
 def build_criterion(loss_type="default"):
     from libs.utils.loss import cross_entropy_loss, mask_iou_loss
     if loss_type == "default":
-        return lambda pred, target, bootstrap=1: [cross_entropy_loss(pred.sigmoid(), target, bootstrap), mask_iou_loss(pred.sigmoid(), target)]
+        # return lambda pred, target, bootstrap=1: [cross_entropy_loss(pred.sigmoid(), target, bootstrap), mask_iou_loss(pred.sigmoid(), target)]
+        return lambda pred, target, bootstrap=1: [cross_entropy_loss(pred, target, bootstrap), mask_iou_loss(pred, target)]
     elif loss_type == "mask2former":
         return SimpleMask2FormerCriterion()
 

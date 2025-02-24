@@ -149,7 +149,7 @@ class DAN(nn.Module):
         # x = self.aspp(after_transform)
         if time is not None:
             time.t2()
-        x = self.Decoder(after_transform, query_feat_l2, query_feat_l1, img)
+        x = self.Decoder(encoder_f[:batch_frame], query_feat_l2, query_feat_l1, img, resize=True)
 
         # pred_map = torch.nn.Sigmoid()(x)
         pred_map = x
