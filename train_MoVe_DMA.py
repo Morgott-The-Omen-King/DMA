@@ -59,6 +59,7 @@ def get_arguments():
     parser.add_argument("--print_interval", type=int, default=10, help="Print progress every N episodes")
     parser.add_argument("--ce_loss_weight", type=float, default=1.0, help="Weight for cross entropy loss")
     parser.add_argument("--iou_loss_weight", type=float, default=1.0, help="Weight for IoU loss")
+    parser.add_argument("--cls_loss_weight", type=float, default=1.0, help="Weight for motion classification loss")
     parser.add_argument("--setting", type=str, default="default", help="default or challenging")
     parser.add_argument("--resume", action="store_true", help="resume training from checkpoint")
     parser.add_argument("--warmup_episodes", type=int, default=500, help="Number of warmup episodes")
@@ -152,7 +153,8 @@ def train():
         num_ways=args.num_ways,
         num_shots=args.num_shots,
         transforms=train_transform,
-        setting=args.setting
+        setting=args.setting,
+        proposal_mask=True
     )
     
     train_sampler = DistributedSampler(train_dataset, shuffle=True)
@@ -173,18 +175,22 @@ def train():
     model.train()
     total_loss = 0
     moving_loss = 0  # 用于计算移动平均损失
-    moving_ce_loss = 0
-    moving_iou_loss = 0
+    moving_mask_ce_loss = 0
+    moving_proposal_ce_loss = 0
+    moving_mask_iou_loss = 0
+    moving_proposal_iou_loss = 0
+    moving_motion_cls_loss = 0
 
     criterion = build_criterion(args.loss_type)
     
-    for episode, (query_frames, query_masks, support_frames, support_masks, _) in enumerate(train_loader, start=start_episode):
+    for episode, (query_frames, query_masks, support_frames, support_masks, _, proposal_masks) in enumerate(train_loader, start=start_episode):
         if episode >= args.total_episodes:
             break
             
         B, _, C, H, W = query_frames.shape
         query_frames = query_frames.view(args.batch_size, args.num_ways, -1, C, H, W)
         query_masks = query_masks.view(args.batch_size, args.num_ways, -1, H, W)
+        proposal_masks = proposal_masks.view(args.batch_size, args.num_ways, -1, H, W)
         
         supp_F = args.support_frames
         K = args.num_shots
@@ -194,30 +200,52 @@ def train():
         # 移动数据到GPU
         query_frames = query_frames.cuda(local_rank, non_blocking=True)
         query_masks = query_masks.cuda(local_rank, non_blocking=True)
+        proposal_masks = proposal_masks.cuda(local_rank, non_blocking=True)
+        
         support_frames = support_frames.cuda(local_rank, non_blocking=True)
         support_masks = support_masks.cuda(local_rank, non_blocking=True)
         support_masks = support_masks
         
         # Forward pass
         optimizer.zero_grad()
-        total_loss = 0
         
         # Forward pass with mixed precision
         with autocast():
-            output, proposal_masks = model(query_frames[:, 0], support_frames, support_masks)  # B, N_way, T, H, W
+            output, output_proposal_masks, cls_motion = model(query_frames[:, 0], support_frames, support_masks)  # B, N_way, T, H, W
             if args.loss_type == 'default':
-                output = F.interpolate(output.view(-1, 1, *output.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=True).sigmoid()
+                output = F.interpolate(output.view(-1, 1, *output.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=False).sigmoid()
                 output = output.view(B, args.num_ways, -1, 1, *size)  # Reshape back to [B, N_way, T, 1, 241, 425]
                 output = output[:, :, :, 0, :, :]
                 
-                proposal_masks = F.interpolate(proposal_masks.view(-1, 1, *proposal_masks.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=True).sigmoid()
-                proposal_masks = proposal_masks.view(B, args.num_ways, -1, 1, *size)
-                proposal_masks = proposal_masks[:, :, :, 0, :, :]
+                output_proposal_masks = F.interpolate(output_proposal_masks.view(-1, 1, *output_proposal_masks.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=False).sigmoid()
+                output_proposal_masks = output_proposal_masks.view(B, args.num_ways, -1, 1, *size)
+                output_proposal_masks = output_proposal_masks[:, :, :, 0, :, :]
                 
-            few_ce_loss, few_iou_loss = criterion(output.flatten(1, 2), query_masks.flatten(1, 2))
-            proposal_ce_loss, proposal_iou_loss = criterion(proposal_masks.flatten(1, 2), query_masks.flatten(1, 2))
+            proposal_ce_loss, proposal_iou_loss = criterion(output_proposal_masks.flatten(1, 2), proposal_masks.flatten(1, 2))
             
-            total_loss = args.ce_loss_weight * (few_ce_loss + proposal_ce_loss) + args.iou_loss_weight * (few_iou_loss + proposal_iou_loss)
+            # cls_motion: B * N_way * 1: 这是一个logits，这个用于表示mask是否存在
+            # Calculate motion classification loss
+            cls_motion = cls_motion.view(B, args.num_ways)  # Reshape to (B, N_way)
+            # Check if there are foreground pixels in query masks
+            cls_target = (query_masks.sum(dim=(2,3,4)) > 0).float()  # B, N_way
+            motion_cls_loss = F.binary_cross_entropy_with_logits(cls_motion, cls_target)
+            
+            # Only calculate loss for objects with foreground masks
+            valid_mask = cls_target > 0
+            
+            # Flatten and filter outputs and masks
+            output_flat = output.flatten(0, 1)[valid_mask.flatten()]  # (valid_samples, H, W) 
+            query_masks_flat = query_masks.flatten(0, 1)[valid_mask.flatten()]  # (valid_samples, H, W)
+            
+            if output_flat.numel() > 0:  # Only compute loss if there are valid samples
+                mask_ce_loss, mask_iou_loss = criterion(output_flat, query_masks_flat)
+            else:
+                mask_ce_loss = torch.tensor(0.0, device=output.device)
+                mask_iou_loss = torch.tensor(0.0, device=output.device)
+            
+            # Add motion classification loss to total loss
+            
+            total_loss = args.ce_loss_weight * (mask_ce_loss + proposal_ce_loss) + args.iou_loss_weight * (mask_iou_loss + proposal_iou_loss) + args.cls_loss_weight * motion_cls_loss
         
         # Backward pass with gradient scaling
         scaler.scale(total_loss).backward()
@@ -228,18 +256,20 @@ def train():
         scheduler.step()
         
         # Update loss statistics
-        moving_few_ce_loss = 0.9 * moving_few_ce_loss + 0.1 * few_ce_loss.item() if episode > 0 else few_ce_loss.item()
+        moving_mask_ce_loss = 0.9 * moving_mask_ce_loss + 0.1 * mask_ce_loss.item() if episode > 0 else mask_ce_loss.item()
         moving_proposal_ce_loss = 0.9 * moving_proposal_ce_loss + 0.1 * proposal_ce_loss.item() if episode > 0 else proposal_ce_loss.item()
-        moving_few_iou_loss = 0.9 * moving_few_iou_loss + 0.1 * few_iou_loss.item() if episode > 0 else few_iou_loss.item()
+        moving_mask_iou_loss = 0.9 * moving_mask_iou_loss + 0.1 * mask_iou_loss.item() if episode > 0 else mask_iou_loss.item()
         moving_proposal_iou_loss = 0.9 * moving_proposal_iou_loss + 0.1 * proposal_iou_loss.item() if episode > 0 else proposal_iou_loss.item()
+        moving_motion_cls_loss = 0.9 * moving_motion_cls_loss + 0.1 * motion_cls_loss.item() if episode > 0 else motion_cls_loss.item()
         moving_loss = 0.9 * moving_loss + 0.1 * total_loss.item() if episode > 0 else total_loss.item()
         
         # Log to tensorboard
         if local_rank == 0:
-            writer.add_scalar('Loss/Few_CE', moving_few_ce_loss, episode)
+            writer.add_scalar('Loss/Mask_CE', moving_mask_ce_loss, episode)
             writer.add_scalar('Loss/Proposal_CE', moving_proposal_ce_loss, episode)
-            writer.add_scalar('Loss/Few_IoU', moving_few_iou_loss, episode)
+            writer.add_scalar('Loss/Mask_IoU', moving_mask_iou_loss, episode)
             writer.add_scalar('Loss/Proposal_IoU', moving_proposal_iou_loss, episode)
+            writer.add_scalar('Loss/Motion_Cls', moving_motion_cls_loss, episode)
             writer.add_scalar('Loss/Total', moving_loss, episode)
             writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], episode)
         
@@ -254,10 +284,11 @@ def train():
             eta = str(datetime.timedelta(seconds=int(eta_seconds)))
             
             log_message = (f'Episode [{episode+1}/{args.total_episodes}], '
-                            f'Few CE Loss: {moving_few_ce_loss:.4f}, '
+                            f'Mask CE Loss: {moving_mask_ce_loss:.4f}, '
                             f'Proposal CE Loss: {moving_proposal_ce_loss:.4f}, '
-                            f'Few IoU Loss: {moving_few_iou_loss:.4f}, '
+                            f'Mask IoU Loss: {moving_mask_iou_loss:.4f}, '
                             f'Proposal IoU Loss: {moving_proposal_iou_loss:.4f}, '
+                            f'Motion Cls Loss: {moving_motion_cls_loss:.4f}, '
                             f'Total Loss: {moving_loss:.4f}, '
                             f'LR: {scheduler.get_last_lr()[0]:.6f}, '
                             f'ETA: {eta}')

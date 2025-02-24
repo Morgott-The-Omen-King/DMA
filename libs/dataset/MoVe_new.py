@@ -140,7 +140,6 @@ class ActionHierarchy:
 
 class MoVeDataset(Dataset):
     def __init__(self, 
-                 data_path=None,
                  train=True, 
                  valid=False,
                  set_index=1, 
@@ -534,19 +533,12 @@ class MoVeDataset(Dataset):
         # Apply transforms
         if self.transforms is not None:
             try:
-                # query_frames, query_masks = self.transforms(all_query_frames, all_query_masks)
-                # support_frames, support_masks = self.transforms(all_support_frames, all_support_masks)
+                query_frames, query_masks = self.transforms(all_query_frames, all_query_masks)
+                support_frames, support_masks = self.transforms(all_support_frames, all_support_masks)
                 if self.proposal_mask:
-                    # _, proposal_masks = self.transforms(all_query_frames, proposal_masks * self.num_ways)
-                    all_query_masks.extend(proposal_masks * self.num_ways)
-                    query_frames_, query_masks_ = self.transforms(all_query_frames * 2, all_query_masks)
-                    support_frames, support_masks = self.transforms(all_support_frames, all_support_masks)
-                    query_frames = query_frames_[:len(all_query_frames)]
-                    query_masks = query_masks_[:len(all_query_frames)]
-                    proposal_masks = query_masks_[len(all_query_frames):]
+                    _, proposal_masks = self.transforms(all_query_frames, proposal_masks * self.num_ways)
                 else:
-                    query_frames, query_masks = self.transforms(all_query_frames, all_query_masks)
-                    support_frames, support_masks = self.transforms(all_support_frames, all_support_masks)
+                    proposal_masks = None
             except Exception as e:
                 print(f"Error applying transforms: {e}")
                 print(f"Query frames shape: {len(all_query_frames)}")

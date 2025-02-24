@@ -20,7 +20,7 @@ class DMA(nn.Module):
                  k_shot=1, 
                  num_support_frames=5,
                  num_query_frames=1,
-                 num_meta_motion_queries=1,
+                 num_meta_motion_queries=100,
                  backbone='resnet50',
                  hidden_dim=256,
                  num_q_former_layers=6):
@@ -71,9 +71,9 @@ class DMA(nn.Module):
         self.prototype_enhancer = PrototypeEnhancer(self.hidden_dim)
         
         self.motion_aware_decoder = MotionAwareDecoder(self.hidden_dim)
-        # ========================================================
-        
-        
+        self.motion_cls_norm = nn.LayerNorm(self.hidden_dim)
+        self.motion_cls_head = nn.Linear(self.hidden_dim, 1)
+        # ======================================================== 
     
     @property
     def device(self):
@@ -171,6 +171,7 @@ class DMA(nn.Module):
         mask_feats = mask_feats.view(B, -1, mask.shape[-1])
         mask_feats = mask_feats * mask.unsqueeze(1)
         mask_feats = mask_feats.sum(dim=-1) / (mask.sum(dim=-1, keepdim=True) + 1e-6)
+        
         return mask_feats
         
     def forward(self, query_video, support_video, support_mask, query_mask=None):
@@ -185,6 +186,7 @@ class DMA(nn.Module):
         
         N_way_mask = []
         proposal_masks = []
+        motion_cls = []
         for N_way in range(self.n_way):
             # 单独处理每一个way
             s_f32, s_f16, s_f8, s_f4 = support_features['ms_feats']
@@ -211,11 +213,7 @@ class DMA(nn.Module):
             q_mask_feats = self.mask_pooling(q_f4, query_proposal_mask.sigmoid())
             q_motion_p, q_motion_pe = self.motion_prototype_network(q_mask_feats.view(B, 1, T, -1), 1, T)
             
-            # support prototype
-            s_mask_feats = self.mask_pooling(s_f4, s_mask)
-            s_motion_p, s_motion_pe = self.motion_prototype_network(s_mask_feats.view(B, self.k_shot, self.num_support_frames, -1), self.k_shot, self.num_support_frames)
-            
-            enhance_q_motion_p, enhance_q_motion_pe = self.prototype_enhancer(q_motion_p, q_motion_pe, s_motion_p, s_motion_pe)
+            enhance_q_motion_p, enhance_q_motion_pe, q_motion_cls = self.prototype_enhancer(q_motion_p, q_motion_pe, s_motion_p, s_motion_pe)
             
             # motion aware decoder
             mask = self.motion_aware_decoder(enhance_q_motion_p, 
@@ -224,14 +222,17 @@ class DMA(nn.Module):
                                              q_f8.view(B, T, -1, *q_f8.shape[-2:]), 
                                              q_f4.view(B, T, -1, *q_f4.shape[-2:]))
             
-            N_way_mask.append(mask)
-            proposal_masks.append(query_proposal_mask)
+            q_motion_cls = self.motion_cls_norm(q_motion_cls)
+            q_motion_cls = self.motion_cls_head(q_motion_cls)
             
+            N_way_mask.append(mask)
+            proposal_masks.append(query_proposal_mask.view(B, T, *query_proposal_mask.shape[-2:]))
+            motion_cls.append(q_motion_cls)
         mask = torch.stack(N_way_mask, dim=1)
         proposal_masks = torch.stack(proposal_masks, dim=1)
+        motion_cls = torch.stack(motion_cls, dim=1)
         
-        
-        return mask, proposal_masks
+        return mask, proposal_masks, motion_cls
 
 
 class MaskProposalGenerator(nn.Module):
@@ -316,8 +317,9 @@ class MotionProtoptyeNetwork(nn.Module):
         self.appear_proj = nn.Linear(hidden_dim, hidden_dim)
         
         # q-former
-        self.meta_motion_queries = nn.Embedding(self.num_meta_motion_queries, self.hidden_dim)
-        self.query_pos_embed = nn.Embedding(self.num_meta_motion_queries, self.hidden_dim)
+        # self.motion_cls = nn.Linear(1, self.num_meta_motion_queries)
+        self.meta_motion_queries = nn.Embedding(1 + self.num_meta_motion_queries, self.hidden_dim)
+        self.query_pos_embed = nn.Embedding(1 + self.num_meta_motion_queries, self.hidden_dim)
         
         self.transformer_self_attention_layers = nn.ModuleList()
         self.transformer_cross_attention_layers_1 = nn.ModuleList()
@@ -474,7 +476,7 @@ class PrototypeEnhancer(nn.Module):
             motion1_p = self.transformer_self_attention_layers[i](motion1_p, tgt_mask=None, tgt_key_padding_mask=None, query_pos=motion1_pe)
             motion1_p = self.transformer_ffn_layers[i](motion1_p)
         
-        return motion1_p, motion1_pe
+        return motion1_p[1:], motion1_pe[1:], motion1_p[0]
     
     
 class MotionAwareDecoder(nn.Module):

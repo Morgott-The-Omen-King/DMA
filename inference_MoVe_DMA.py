@@ -25,6 +25,7 @@ from libs.dataset.MoVe import MoVeDataset
 from libs.models.DMA import DMA
 from libs.config.DAN_config import OPTION as opt
 
+
 def setup_ddp():
     """Initialize DDP environment"""
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -160,7 +161,7 @@ def test():
                     end_idx = min(start_idx + chunk_size, T)
                     chunk_query = query_frames[:, 0, start_idx:end_idx]
                     
-                    pred_map = model(chunk_query, support_frames, support_masks) # B, N_way, T, H, W
+                    pred_map, _ = model(chunk_query, support_frames, support_masks) # B, N_way, T, H, W
                     
                     # Resize pred_map to match expected size [B, N_way, T, 1, 241, 425] using interpolation
                     pred_map = F.interpolate(pred_map.view(-1, 1, *pred_map.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=False)
