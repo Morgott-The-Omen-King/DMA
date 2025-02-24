@@ -204,13 +204,20 @@ def train():
         
         # Forward pass with mixed precision
         with autocast():
-            output = model(query_frames[:, 0], support_frames, support_masks)  # B, N_way, T, H, W
+            output, proposal_masks = model(query_frames[:, 0], support_frames, support_masks)  # B, N_way, T, H, W
             if args.loss_type == 'default':
                 output = F.interpolate(output.view(-1, 1, *output.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=True).sigmoid()
                 output = output.view(B, args.num_ways, -1, 1, *size)  # Reshape back to [B, N_way, T, 1, 241, 425]
                 output = output[:, :, :, 0, :, :]
+                
+                proposal_masks = F.interpolate(proposal_masks.view(-1, 1, *proposal_masks.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=True).sigmoid()
+                proposal_masks = proposal_masks.view(B, args.num_ways, -1, 1, *size)
+                proposal_masks = proposal_masks[:, :, :, 0, :, :]
+                
             few_ce_loss, few_iou_loss = criterion(output.flatten(1, 2), query_masks.flatten(1, 2))
-            total_loss = args.ce_loss_weight * few_ce_loss + args.iou_loss_weight * few_iou_loss
+            proposal_ce_loss, proposal_iou_loss = criterion(proposal_masks.flatten(1, 2), query_masks.flatten(1, 2))
+            
+            total_loss = args.ce_loss_weight * (few_ce_loss + proposal_ce_loss) + args.iou_loss_weight * (few_iou_loss + proposal_iou_loss)
         
         # Backward pass with gradient scaling
         scaler.scale(total_loss).backward()
@@ -221,14 +228,18 @@ def train():
         scheduler.step()
         
         # Update loss statistics
-        moving_ce_loss = 0.9 * moving_ce_loss + 0.1 * few_ce_loss.item() if episode > 0 else few_ce_loss.item()
-        moving_iou_loss = 0.9 * moving_iou_loss + 0.1 * few_iou_loss.item() if episode > 0 else few_iou_loss.item()
+        moving_few_ce_loss = 0.9 * moving_few_ce_loss + 0.1 * few_ce_loss.item() if episode > 0 else few_ce_loss.item()
+        moving_proposal_ce_loss = 0.9 * moving_proposal_ce_loss + 0.1 * proposal_ce_loss.item() if episode > 0 else proposal_ce_loss.item()
+        moving_few_iou_loss = 0.9 * moving_few_iou_loss + 0.1 * few_iou_loss.item() if episode > 0 else few_iou_loss.item()
+        moving_proposal_iou_loss = 0.9 * moving_proposal_iou_loss + 0.1 * proposal_iou_loss.item() if episode > 0 else proposal_iou_loss.item()
         moving_loss = 0.9 * moving_loss + 0.1 * total_loss.item() if episode > 0 else total_loss.item()
         
         # Log to tensorboard
         if local_rank == 0:
-            writer.add_scalar('Loss/CE', moving_ce_loss, episode)
-            writer.add_scalar('Loss/IoU', moving_iou_loss, episode)
+            writer.add_scalar('Loss/Few_CE', moving_few_ce_loss, episode)
+            writer.add_scalar('Loss/Proposal_CE', moving_proposal_ce_loss, episode)
+            writer.add_scalar('Loss/Few_IoU', moving_few_iou_loss, episode)
+            writer.add_scalar('Loss/Proposal_IoU', moving_proposal_iou_loss, episode)
             writer.add_scalar('Loss/Total', moving_loss, episode)
             writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], episode)
         
@@ -243,8 +254,10 @@ def train():
             eta = str(datetime.timedelta(seconds=int(eta_seconds)))
             
             log_message = (f'Episode [{episode+1}/{args.total_episodes}], '
-                            f'CE Loss: {moving_ce_loss:.4f}, '
-                            f'IoU Loss: {moving_iou_loss:.4f}, '
+                            f'Few CE Loss: {moving_few_ce_loss:.4f}, '
+                            f'Proposal CE Loss: {moving_proposal_ce_loss:.4f}, '
+                            f'Few IoU Loss: {moving_few_iou_loss:.4f}, '
+                            f'Proposal IoU Loss: {moving_proposal_iou_loss:.4f}, '
                             f'Total Loss: {moving_loss:.4f}, '
                             f'LR: {scheduler.get_last_lr()[0]:.6f}, '
                             f'ETA: {eta}')

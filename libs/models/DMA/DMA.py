@@ -184,6 +184,7 @@ class DMA(nn.Module):
         support_features = self.extract_features(support_video.view(-1, C, H, W), mask_feats=True)
         
         N_way_mask = []
+        proposal_masks = []
         for N_way in range(self.n_way):
             # 单独处理每一个way
             s_f32, s_f16, s_f8, s_f4 = support_features['ms_feats']
@@ -199,8 +200,12 @@ class DMA(nn.Module):
             
             s_mask = support_mask[:, N_way].flatten(0, 2)
             
+            # support prototype
+            s_mask_feats = self.mask_pooling(s_f4, s_mask)
+            s_motion_p, s_motion_pe = self.motion_prototype_network(s_mask_feats.view(B, self.k_shot, self.num_support_frames, -1), self.k_shot, self.num_support_frames)
+            
             q_f32, q_f16, q_f8, q_f4 = query_features['ms_feats']
-            query_proposal_mask = self.proposal_generator(q_f32, q_f16, q_f8)  # 需要添加一个motion_aware模块
+            query_proposal_mask = self.proposal_generator(q_f32, q_f16, q_f8, s_motion_p, s_motion_pe)  # 需要添加一个motion_aware模块
             
             # motion prototype
             q_mask_feats = self.mask_pooling(q_f4, query_proposal_mask.sigmoid())
@@ -220,11 +225,13 @@ class DMA(nn.Module):
                                              q_f4.view(B, T, -1, *q_f4.shape[-2:]))
             
             N_way_mask.append(mask)
+            proposal_masks.append(query_proposal_mask)
             
         mask = torch.stack(N_way_mask, dim=1)
+        proposal_masks = torch.stack(proposal_masks, dim=1)
         
         
-        return mask
+        return mask, proposal_masks
 
 
 class MaskProposalGenerator(nn.Module):
@@ -232,43 +239,69 @@ class MaskProposalGenerator(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         
-        # 特征金字塔卷积层
-        self.conv_f32 = nn.Conv2d(hidden_dim, hidden_dim//2, 3, padding=1)
-        self.conv_f16 = nn.Conv2d(hidden_dim, hidden_dim//2, 3, padding=1) 
-        self.conv_f8 = nn.Conv2d(hidden_dim, hidden_dim//2, 3, padding=1)
+        # Cross attention layers
+        self.transformer_cross_attention_layers = nn.ModuleList([
+            CrossAttentionLayer(
+                d_model=hidden_dim,
+                nhead=8,
+                dropout=0.0,
+                normalize_before=False
+            ) for _ in range(2)
+        ])
         
-        # 特征融合层
-        self.fusion_conv1 = nn.Conv2d(hidden_dim//2 * 3, hidden_dim//2, 3, padding=1)
-        self.fusion_conv2 = nn.Conv2d(hidden_dim//2, hidden_dim//4, 3, padding=1)
-        self.fusion_conv3 = nn.Conv2d(hidden_dim//4, 1, 1)
+        # Feature fusion convs
+        self.fusion_conv1 = nn.Conv2d(hidden_dim*2, hidden_dim, 3, padding=1)
+        self.fusion_conv2 = nn.Conv2d(hidden_dim*2, hidden_dim, 3, padding=1)
         
-        # 激活函数
-        self.relu = nn.ReLU(inplace=True)
+        # Final mask prediction
+        self.mask_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim//2, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim//2, 1, 1)
+        )
     
-    def forward(self, q_f32, q_f16, q_f8):
+    def forward(self, q_f32, q_f16, q_f8, motion_p, motion_pe):
         # q_f32: (B, c, h/32, w/32)
         # q_f16: (B, c, h/16, w/16)
         # q_f8: (B, c, h/8, w/8)
-    
-        # 特征金字塔处理
-        f32 = self.relu(self.conv_f32(q_f32))
-        f16 = self.relu(self.conv_f16(q_f16))
-        f8 = self.relu(self.conv_f8(q_f8))
+        # motion_p: (N, B, hidden_dim)
+        # motion_pe: (N, B, hidden_dim)
         
-        # 上采样f32到f16尺度
-        f32_up = F.interpolate(f32, size=f16.shape[-2:], mode='bilinear', align_corners=False)
+        B = q_f16.shape[0]
+        T = q_f16.shape[0] // motion_p.shape[1]
         
-        # 上采样f16和f32到f8尺度
-        f16_up = F.interpolate(f16, size=f8.shape[-2:], mode='bilinear', align_corners=False)
-        f32_up = F.interpolate(f32_up, size=f8.shape[-2:], mode='bilinear', align_corners=False)
+        # Reshape features for cross attention
+        f16_flat = q_f16.flatten(-2).permute(2, 0, 1)  # (HW, B, C)
+        f8_flat = q_f8.flatten(-2).permute(2, 0, 1)  # (HW, B, C)
         
-        # 特征融合
-        fused = torch.cat([f8, f16_up, f32_up], dim=1)
-        x = self.relu(self.fusion_conv1(fused))
-        x = self.relu(self.fusion_conv2(x))
-        x = self.fusion_conv3(x)
+        motion_p = motion_p.repeat(1, T, 1)
+        motion_pe = motion_pe.repeat(1, T, 1)
+                
+        # Cross attention with motion prototype
+        f16_enhanced = self.transformer_cross_attention_layers[0](
+            f16_flat, motion_p,
+            pos=motion_pe,
+            query_pos=None
+        )
         
-        return x.squeeze(1)
+        f8_enhanced = self.transformer_cross_attention_layers[1](
+            f8_flat, motion_p,
+            pos=motion_pe,
+            query_pos=None
+        )
+        
+        # Reshape back to spatial features
+        f16_enhanced = f16_enhanced.permute(1, 2, 0).view(B, -1, *q_f16.shape[-2:])  # (B, C, H/16, W/16)
+        f8_enhanced = f8_enhanced.permute(1, 2, 0).view(B, -1, *q_f8.shape[-2:])  # (B, C, H/8, W/8)
+        
+        # Progressive feature fusion
+        f16_up = F.interpolate(f16_enhanced, size=q_f8.shape[-2:], mode='bilinear', align_corners=False)
+        fused_8 = self.fusion_conv1(torch.cat([f8_enhanced, f16_up], dim=1))  # (B, C, H/8, W/8)
+        
+        # Predict mask
+        mask = self.mask_conv(fused_8)  # (B, 1, H/8, W/8)
+        
+        return mask.squeeze(1)
 
 
 class MotionProtoptyeNetwork(nn.Module):
