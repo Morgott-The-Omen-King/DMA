@@ -211,7 +211,13 @@ class DMA(nn.Module):
             
             # motion prototype
             q_mask_feats = self.mask_pooling(q_f4, query_proposal_mask.sigmoid())
-            q_motion_p, q_motion_pe = self.motion_prototype_network(q_mask_feats.view(B, 1, T, -1), 1, T)
+            try:
+                q_motion_p, q_motion_pe = self.motion_prototype_network(q_mask_feats.view(B, 1, T, -1), 1, T)
+            except Exception as e:
+                print(e)
+                print(q_mask_feats.shape)
+                print(q_f4.shape)
+                raise e
             
             enhance_q_motion_p, enhance_q_motion_pe, q_motion_cls = self.prototype_enhancer(q_motion_p, q_motion_pe, s_motion_p, s_motion_pe)
             
@@ -397,7 +403,7 @@ class MotionProtoptyeNetwork(nn.Module):
         # 1. 提取motion和appearance特征
         # 计算相邻帧之间的差异得到motion特征
         motion_feats = features[..., 1:, :] - features[..., :-1, :]
-        zero_motion = torch.zeros_like(motion_feats[...,:1,:])
+        zero_motion = torch.zeros(B, K, 1, feat_dim, device=self.device)
         motion_feats = torch.cat([motion_feats, zero_motion], dim=2)
         
         # 将motion和appearance特征映射到hidden_dim
@@ -422,8 +428,14 @@ class MotionProtoptyeNetwork(nn.Module):
         motion_q = self.meta_motion_queries.weight.unsqueeze(1).repeat(1, B, 1)
         motion_pe = self.query_pos_embed.weight.unsqueeze(1).repeat(1, B, 1)
         
-        motion_feats = motion_feats.view(B, k_shot * num_support_frames, self.hidden_dim).permute(1, 0, 2)
-        appear_feats = appear_feats.view(B, k_shot * num_support_frames, self.hidden_dim).permute(1, 0, 2)
+        try:
+            motion_feats = motion_feats.view(B, k_shot * num_support_frames, self.hidden_dim).permute(1, 0, 2)
+            appear_feats = appear_feats.view(B, k_shot * num_support_frames, self.hidden_dim).permute(1, 0, 2)
+        except Exception as e:
+            print(e)
+            print(motion_feats.shape)
+            print(appear_feats.shape)
+            raise e
         
         # 4. 通过q-former提取prototype
         for i in range(self.num_q_former_layers):

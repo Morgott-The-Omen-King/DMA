@@ -128,6 +128,8 @@ def test():
         start_time = time.time()
     
     results = []
+    total_correct = 0
+    total_samples = 0
     with torch.no_grad():
         for i, (query_frames, query_masks, support_frames, support_masks, video_ids, categories) in enumerate(test_loader):
             if i >= args.num_episodes:
@@ -154,14 +156,15 @@ def test():
                 support_masks = support_masks.view(B, N, K, sup_F, H, W)
                 
                 # Process in chunks to avoid OOM
-                chunk_size = 50
+                chunk_size = 5
                 pred_maps = []
+                pred_cls = []
                 
                 for start_idx in range(0, T, chunk_size):
                     end_idx = min(start_idx + chunk_size, T)
                     chunk_query = query_frames[:, 0, start_idx:end_idx]
                     
-                    pred_map, _ = model(chunk_query, support_frames, support_masks) # B, N_way, T, H, W
+                    pred_map, _, motion_cls = model(chunk_query, support_frames, support_masks) # B, N_way, T, H, W
                     
                     # Resize pred_map to match expected size [B, N_way, T, 1, 241, 425] using interpolation
                     pred_map = F.interpolate(pred_map.view(-1, 1, *pred_map.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=False)
@@ -169,10 +172,20 @@ def test():
                     
                     # pred_map = torch.sigmoid(pred_map)
                     pred_maps.append(pred_map.sigmoid())
-        
+                    pred_cls.append(motion_cls[..., 0])
+                cls_target = (query_masks.sum(dim=(2,3,4)) > 0).float()  # B, N_way
                 # Stack predictions for all ways
                 pred_maps = torch.cat(pred_maps, dim=2)  # torch.Size([1, 2, 60, 1, 241, 425])
-                
+                pred_cls = torch.cat(pred_cls, dim=0)  # torch.Size([1, 2])
+                pred_cls = torch.mean(pred_cls, dim=0, keepdim=True)  # torch.Size([B, N_way])
+
+                # Calculate classification accuracy
+                pred_cls_binary = (pred_cls > 0.5).float()
+                correct = (pred_cls_binary == cls_target).sum().item()
+                total = cls_target.numel()
+                total_correct += correct
+                total_samples += total
+
                 # 获取形状信息
                 B, N, T, _, H, W = pred_maps.shape
                 
@@ -253,8 +266,10 @@ def test():
                     eta_seconds = remaining_episodes * time_per_episode
                     eta = str(datetime.timedelta(seconds=int(eta_seconds)))
                     
+                    accuracy = total_correct / total_samples * 100
                     print(f'Episode [{i+1}/{args.num_episodes}], '
                           f'Frames per query: {T}, '
+                          f'Classification Accuracy: {accuracy:.2f}%, '
                           f'ETA: {eta}')
                     
             except Exception as e:
