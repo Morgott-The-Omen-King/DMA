@@ -404,6 +404,91 @@ class MoVeDataset(Dataset):
         selected_frames = sorted(selected_action_frames + selected_other_frames)
         return selected_frames
 
+    def sample_frames_with_action_support(self, valid_frames, all_frames, num_frames, min_action_frames=1):
+        """采样帧，确保至少包含指定数量的动作帧，并从整个动作序列中均匀采样
+        Args:
+            valid_frames: 包含目标动作的帧列表
+            all_frames: 所有可用帧列表
+            num_frames: 需要采样的总帧数
+            min_action_frames: 最少需要包含的动作帧数量
+        Returns:
+            采样的帧索引列表
+        """
+        if not valid_frames:
+            return random.sample(all_frames, num_frames)
+            
+        # 确保至少采样min_action_frames个动作帧，并且从整个动作序列中均匀采样
+        num_action_frames = min(len(valid_frames), min(min_action_frames, num_frames))
+        
+        if num_action_frames == len(valid_frames):
+            # 如果需要的动作帧数等于有效帧数，直接全部使用
+            selected_action_frames = valid_frames
+        else:
+            # 均匀采样：计算采样间隔并选择帧
+            valid_frames = sorted(valid_frames)
+            
+            # 如果帧数不够，从两端拓展
+            if len(valid_frames) < num_action_frames:
+                # 计算需要额外添加的帧数
+                extra_frames_needed = num_action_frames - len(valid_frames)
+                
+                # 从两端拓展
+                left_expand = extra_frames_needed // 2
+                right_expand = extra_frames_needed - left_expand
+                
+                # 获取左侧和右侧可扩展的帧
+                min_valid = min(valid_frames)
+                max_valid = max(valid_frames)
+                
+                left_candidates = [f for f in all_frames if f < min_valid]
+                right_candidates = [f for f in all_frames if f > max_valid]
+                
+                # 选择最接近的帧
+                left_candidates.sort(reverse=True)  # 降序，选择最接近的
+                right_candidates.sort()  # 升序，选择最接近的
+                
+                left_expand_frames = left_candidates[:left_expand] if left_candidates else []
+                right_expand_frames = right_candidates[:right_expand] if right_candidates else []
+                
+                # 如果一侧扩展不足，从另一侧补充
+                if len(left_expand_frames) < left_expand and right_candidates:
+                    right_expand_frames.extend(right_candidates[right_expand:right_expand+(left_expand-len(left_expand_frames))])
+                elif len(right_expand_frames) < right_expand and left_candidates:
+                    left_expand_frames.extend(left_candidates[left_expand:left_expand+(right_expand-len(right_expand_frames))])
+                
+                # 合并扩展的帧
+                expanded_valid_frames = left_expand_frames + valid_frames + right_expand_frames
+                expanded_valid_frames.sort()
+                
+                # 均匀采样
+                step = len(expanded_valid_frames) / num_action_frames
+                indices = [int(i * step) for i in range(num_action_frames)]
+                selected_action_frames = [expanded_valid_frames[i] for i in indices]
+            else:
+                # 正常均匀采样
+                step = len(valid_frames) / num_action_frames
+                indices = [int(i * step) for i in range(num_action_frames)]
+                selected_action_frames = [valid_frames[i] for i in indices]
+        
+        # 剩余帧数从所有帧中随机采样
+        remaining_frames = num_frames - len(selected_action_frames)
+        other_frames = [f for f in all_frames if f not in selected_action_frames]
+        if remaining_frames > 0:
+            if len(other_frames) >= remaining_frames:
+                selected_other_frames = random.sample(other_frames, remaining_frames)
+            else:
+                try:
+                    selected_other_frames = random.choices(other_frames, k=remaining_frames)
+                except:
+                    print(f"Error sampling other frames for video")
+                    selected_other_frames = []
+        else:
+            selected_other_frames = []
+        
+        # 合并所有选择的帧并按时间顺序排序
+        selected_frames = sorted(selected_action_frames + selected_other_frames)
+        return selected_frames
+    
     def get_consecutive_frames(self, center_frame, num_frames, max_frame):
         """获取以center_frame为中心的连续帧序列
         Args:
@@ -479,11 +564,11 @@ class MoVeDataset(Dataset):
         valid_query_frames, all_query_frames_list = self.get_valid_frames(query_video_id, query_category)
         
         # 为query帧确保至少包含1个动作帧
-        query_indices = self.sample_frames_with_action(
+        query_indices = self.sample_frames_with_action_support(
             valid_query_frames,
             all_query_frames_list,
             self.query_frames,
-            min_action_frames=1
+            min_action_frames=self.query_frames - 1
         )
         
         if self.proposal_mask:
@@ -507,11 +592,11 @@ class MoVeDataset(Dataset):
                 valid_support_frames, all_support_frames_list = self.get_valid_frames(support_video_id, category)
                 
                 # 为support帧确保至少包含2个动作帧
-                shot_indices = self.sample_frames_with_action(
+                shot_indices = self.sample_frames_with_action_support(
                     valid_support_frames,
                     all_support_frames_list,
                     self.support_frames,
-                    min_action_frames=2
+                    min_action_frames=self.support_frames - 1
                 )
                 
                 frames, masks = self.get_frames(support_video_id, shot_indices, category)
@@ -675,4 +760,6 @@ if __name__ == "__main__":
     
     # Get one episode
     query_frames, query_masks, support_frames, support_masks, query_video_ids, proposal_masks = dataset[0]
+    
+    pass
     
