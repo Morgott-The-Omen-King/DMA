@@ -185,6 +185,10 @@ def test():
                 total = cls_target.numel()
                 total_correct += correct
                 total_samples += total
+                
+                # 一次性添加所有需要的维度
+                pred_cls_expanded = pred_cls[:, :, None, None, None, None].sigmoid()
+                pred_maps = pred_cls_expanded * pred_maps
 
                 # 获取形状信息
                 B, N, T, _, H, W = pred_maps.shape
