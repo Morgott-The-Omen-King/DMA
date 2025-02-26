@@ -134,6 +134,17 @@ def test():
     total_positive_samples = 0
     total_negative_correct = 0
     total_negative_samples = 0
+    total_episodes = 0
+    total_perfect_episodes = 0  # Count episodes where all ways are correctly classified
+    
+    # Add new metrics
+    total_all_zero_episodes = 0  # Episodes where all ways are 0
+    total_all_zero_correct = 0  # Correctly predicted all-zero episodes
+    total_all_one_episodes = 0  # Episodes where all ways are 1
+    total_all_one_correct = 0  # Correctly predicted all-one episodes
+    total_mixed_episodes = 0  # Episodes with mix of 0s and 1s
+    total_mixed_correct = 0  # Correctly predicted mixed episodes
+    
     with torch.no_grad():
         for i, (query_frames, query_masks, support_frames, support_masks, video_ids, categories) in enumerate(test_loader):
             if i >= args.num_episodes:
@@ -160,7 +171,7 @@ def test():
                 support_masks = support_masks.view(B, N, K, sup_F, H, W)
                 
                 # Process in chunks to avoid OOM
-                chunk_size = 5
+                chunk_size = 50
                 pred_maps = []
                 pred_cls = []
                 
@@ -174,11 +185,10 @@ def test():
                     pred_map = F.interpolate(pred_map.view(-1, 1, *pred_map.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=False)
                     pred_map = pred_map.view(B, N, -1, 1, 241, 425)  # Reshape back to [B, N_way, T, 1, 241, 425]
                     
-                    # pred_map = torch.sigmoid(pred_map)
                     pred_maps.append(pred_map.sigmoid())
                     pred_cls.append(motion_cls[..., 0])
+                
                 cls_target = (query_masks.sum(dim=(2,3,4)) > 0).float()  # B, N_way
-                # Stack predictions for all ways
                 pred_maps = torch.cat(pred_maps, dim=2)  # torch.Size([1, 2, 60, 1, 241, 425])
                 pred_cls = torch.cat(pred_cls, dim=0)  # torch.Size([1, 2])
                 pred_cls = torch.mean(pred_cls, dim=0, keepdim=True)  # torch.Size([B, N_way])
@@ -186,6 +196,7 @@ def test():
                 # Calculate classification accuracy
                 mask_thr = 0.5
                 pred_cls_binary = (pred_cls > mask_thr).float()
+                pred_cls_sigmoid = pred_cls.sigmoid()
                 
                 # Calculate overall accuracy
                 correct = (pred_cls_binary == cls_target).sum().item()
@@ -207,26 +218,63 @@ def test():
                 total_negative_correct += negative_correct
                 total_negative_samples += negative_samples
                 
-                # 一次性添加所有需要的维度
-                pred_cls_expanded = pred_cls[:, :, None, None, None, None].sigmoid()
-                pred_maps = pred_cls_expanded * pred_maps
-
-                # 获取形状信息
+                # Calculate perfect episode accuracy (all ways correctly classified)
+                total_episodes += B
+                for b in range(B):
+                    if (pred_cls_binary[b] == cls_target[b]).all().item():
+                        total_perfect_episodes += 1
+                        
+                    # Calculate new metrics
+                    target = cls_target[b]
+                    pred = pred_cls_sigmoid[b]
+                    
+                    # All zeros case
+                    if (target == 0).all():
+                        total_all_zero_episodes += 1
+                        if (pred < mask_thr).all():
+                            total_all_zero_correct += 1
+                            
+                    # All ones case        
+                    elif (target == 1).all():
+                        total_all_one_episodes += 1
+                        if (pred > mask_thr).all():
+                            total_all_one_correct += 1
+                            
+                    # Mixed case
+                    else:
+                        total_mixed_episodes += 1
+                        # For mixed case, check if prediction with highest confidence matches ground truth
+                        pred_above_thr = pred > mask_thr
+                        if pred_above_thr.any():  # Only check if any prediction is above threshold
+                            max_conf_idx = pred.argmax()
+                            if target[max_conf_idx] == 1:  # Check if highest confidence prediction is correct
+                                total_mixed_correct += 1
+                
+                # 修改后的合并逻辑：将每个way的mask中大于阈值的部分赋值为对应的pred_cls的值
                 B, N, T, _, H, W = pred_maps.shape
+                pred_cls_sigmoid = pred_cls.sigmoid()  # 确保pred_cls是sigmoid后的值
                 
                 # 创建one-hot编码的mask
                 one_hot_masks = torch.zeros(B, N+1, T, H, W, device=pred_maps.device)
                 
                 # 设置背景类(索引0)
+                # 如果所有way的mask值都小于阈值，则为背景
                 background_mask = (pred_maps.max(dim=1)[0] < mask_thr).squeeze(2)  # B x T x H x W
                 one_hot_masks[:,0] = background_mask
                 
-                # 设置前景类(索引1到N)
+                # 对于每个way，将大于阈值的位置赋值为对应的pred_cls值
                 for n in range(N):
-                    one_hot_masks[:,n+1] = (pred_maps[:,n,:,0] > mask_thr)
+                    # 获取当前way的mask
+                    current_way_mask = pred_maps[:,n,:,0]  # B x T x H x W
+                    # 获取当前way的pred_cls值
+                    current_way_cls = pred_cls_sigmoid[:,n,None,None,None]  # B x 1 x 1 x 1
+                    
+                    # 将大于阈值的位置赋值为对应的pred_cls值
+                    mask_above_threshold = (current_way_mask > mask_thr).float()
+                    # 将mask值乘以pred_cls值
+                    one_hot_masks[:,n+1] = mask_above_threshold * current_way_cls
                 
-                # 确保每个位置只有一个类别为1
-                one_hot_masks = one_hot_masks.float()
+                # 确保每个位置只有一个类别为1（选择最大值的类别）
                 max_vals, max_indices = torch.max(one_hot_masks, dim=1, keepdim=True)
                 one_hot_masks = torch.zeros_like(one_hot_masks).scatter_(1, max_indices, 1.0)
                 
@@ -294,12 +342,22 @@ def test():
                     overall_accuracy = total_correct / total_samples * 100 if total_samples > 0 else 0
                     positive_accuracy = total_positive_correct / total_positive_samples * 100 if total_positive_samples > 0 else 0
                     negative_accuracy = total_negative_correct / total_negative_samples * 100 if total_negative_samples > 0 else 0
+                    perfect_episode_accuracy = total_perfect_episodes / total_episodes * 100 if total_episodes > 0 else 0
+                    
+                    # Calculate new accuracy metrics
+                    all_zero_accuracy = total_all_zero_correct / total_all_zero_episodes * 100 if total_all_zero_episodes > 0 else 0
+                    all_one_accuracy = total_all_one_correct / total_all_one_episodes * 100 if total_all_one_episodes > 0 else 0
+                    mixed_accuracy = total_mixed_correct / total_mixed_episodes * 100 if total_mixed_episodes > 0 else 0
                     
                     print(f'Episode [{i+1}/{args.num_episodes}], '
                           f'Frames per query: {T}, '
                           f'Overall Accuracy: {overall_accuracy:.2f}%, '
                           f'Positive Accuracy: {positive_accuracy:.2f}%, '
                           f'Negative Accuracy: {negative_accuracy:.2f}%, '
+                          f'Perfect Episode Accuracy: {perfect_episode_accuracy:.2f}%, '
+                          f'All-Zero Accuracy: {all_zero_accuracy:.2f}%, '
+                          f'All-One Accuracy: {all_one_accuracy:.2f}%, '
+                          f'Mixed-Case Accuracy: {mixed_accuracy:.2f}%, '
                           f'ETA: {eta}')
                     
             except Exception as e:
