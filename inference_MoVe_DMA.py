@@ -130,6 +130,10 @@ def test():
     results = []
     total_correct = 0
     total_samples = 0
+    total_positive_correct = 0
+    total_positive_samples = 0
+    total_negative_correct = 0
+    total_negative_samples = 0
     with torch.no_grad():
         for i, (query_frames, query_masks, support_frames, support_masks, video_ids, categories) in enumerate(test_loader):
             if i >= args.num_episodes:
@@ -180,11 +184,28 @@ def test():
                 pred_cls = torch.mean(pred_cls, dim=0, keepdim=True)  # torch.Size([B, N_way])
 
                 # Calculate classification accuracy
-                pred_cls_binary = (pred_cls > 0.5).float()
+                mask_thr = 0.5
+                pred_cls_binary = (pred_cls > mask_thr).float()
+                
+                # Calculate overall accuracy
                 correct = (pred_cls_binary == cls_target).sum().item()
                 total = cls_target.numel()
                 total_correct += correct
                 total_samples += total
+                
+                # Calculate positive class accuracy (true positives)
+                positive_mask = (cls_target == 1.0)
+                positive_correct = ((pred_cls_binary == cls_target) & positive_mask).sum().item()
+                positive_samples = positive_mask.sum().item()
+                total_positive_correct += positive_correct
+                total_positive_samples += positive_samples
+                
+                # Calculate negative class accuracy (true negatives)
+                negative_mask = (cls_target == 0.0)
+                negative_correct = ((pred_cls_binary == cls_target) & negative_mask).sum().item()
+                negative_samples = negative_mask.sum().item()
+                total_negative_correct += negative_correct
+                total_negative_samples += negative_samples
                 
                 # 一次性添加所有需要的维度
                 pred_cls_expanded = pred_cls[:, :, None, None, None, None].sigmoid()
@@ -197,12 +218,12 @@ def test():
                 one_hot_masks = torch.zeros(B, N+1, T, H, W, device=pred_maps.device)
                 
                 # 设置背景类(索引0)
-                background_mask = (pred_maps.max(dim=1)[0] < 0.5).squeeze(2)  # B x T x H x W
+                background_mask = (pred_maps.max(dim=1)[0] < mask_thr).squeeze(2)  # B x T x H x W
                 one_hot_masks[:,0] = background_mask
                 
                 # 设置前景类(索引1到N)
                 for n in range(N):
-                    one_hot_masks[:,n+1] = (pred_maps[:,n,:,0] > 0.5)
+                    one_hot_masks[:,n+1] = (pred_maps[:,n,:,0] > mask_thr)
                 
                 # 确保每个位置只有一个类别为1
                 one_hot_masks = one_hot_masks.float()
@@ -270,10 +291,15 @@ def test():
                     eta_seconds = remaining_episodes * time_per_episode
                     eta = str(datetime.timedelta(seconds=int(eta_seconds)))
                     
-                    accuracy = total_correct / total_samples * 100
+                    overall_accuracy = total_correct / total_samples * 100 if total_samples > 0 else 0
+                    positive_accuracy = total_positive_correct / total_positive_samples * 100 if total_positive_samples > 0 else 0
+                    negative_accuracy = total_negative_correct / total_negative_samples * 100 if total_negative_samples > 0 else 0
+                    
                     print(f'Episode [{i+1}/{args.num_episodes}], '
                           f'Frames per query: {T}, '
-                          f'Classification Accuracy: {accuracy:.2f}%, '
+                          f'Overall Accuracy: {overall_accuracy:.2f}%, '
+                          f'Positive Accuracy: {positive_accuracy:.2f}%, '
+                          f'Negative Accuracy: {negative_accuracy:.2f}%, '
                           f'ETA: {eta}')
                     
             except Exception as e:
