@@ -522,7 +522,7 @@ class MoVeDataset(Dataset):
         all_support_masks = []
         all_query_frames = []
         all_query_masks = []
-        if random.random() < 0.7:
+        if random.random() < 0.3:
             selected_categories = self.action_hierarchy.sample_fine_grained_episode(self.num_ways + 1)
             query_category = random.choice(selected_categories)
             selected_categories = selected_categories[:self.num_ways]
@@ -648,6 +648,7 @@ class MoVeDataset(Dataset):
         #     raise ValueError(f"Not enough categories for {self.num_ways}-way testing")
         # selected_categories = random.sample(self.selected_categories, self.num_ways)
         selected_categories = self.action_hierarchy.sample_fine_grained_episode(self.num_ways + 1)
+        # selected_categories = random.sample(self.selected_categories, self.num_ways + 1)
         query_category = random.choice(selected_categories)
         selected_categories = selected_categories[:self.num_ways]
         # print(selected_categories)
@@ -748,10 +749,10 @@ if __name__ == "__main__":
     dataset = MoVeDataset(
         train=True,
         valid=False,
-        support_frames=10,
+        support_frames=5,
         query_frames=5,
-        num_ways=5,
-        num_shots=5,
+        num_ways=2,
+        num_shots=1,
         group=0,
         setting='default',
         proposal_mask=True,

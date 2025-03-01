@@ -180,6 +180,10 @@ def train():
     moving_mask_iou_loss = 0
     moving_proposal_iou_loss = 0
     moving_motion_cls_loss = 0
+    moving_gt_ce_loss = 0
+    moving_gt_iou_loss = 0
+    moving_gt_motion_cls_loss = 0
+    moving_support_motion_cls_loss = 0
 
     criterion = build_criterion(args.loss_type)
     
@@ -211,7 +215,7 @@ def train():
         
         # Forward pass with mixed precision
         with autocast():
-            output, output_proposal_masks, cls_motion = model(query_frames[:, 0], support_frames, support_masks)  # B, N_way, T, H, W
+            output, output_cls_motion, gt_otuput, gt_cls_motion, output_proposal_masks, support_output_motion_cls, support_gt_motion_cls = model(query_frames[:, 0], support_frames, support_masks, query_masks)  # B, N_way, T, H, W
             if args.loss_type == 'default':
                 output = F.interpolate(output.view(-1, 1, *output.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=False).sigmoid()
                 output = output.view(B, args.num_ways, -1, 1, *size)  # Reshape back to [B, N_way, T, 1, 241, 425]
@@ -221,14 +225,19 @@ def train():
                 output_proposal_masks = output_proposal_masks.view(B, args.num_ways, -1, 1, *size)
                 output_proposal_masks = output_proposal_masks[:, :, :, 0, :, :]
                 
+                gt_output_masks = F.interpolate(gt_otuput.view(-1, 1, *gt_otuput.shape[-2:]), size=(241, 425), mode='bilinear', align_corners=False).sigmoid()
+                gt_output_masks = gt_output_masks.view(B, args.num_ways, -1, 1, *size)
+                gt_output_masks = gt_output_masks[:, :, :, 0, :, :]
+    
             proposal_ce_loss, proposal_iou_loss = criterion(output_proposal_masks.flatten(1, 2), proposal_masks.flatten(1, 2))
             
             # cls_motion: B * N_way * 1: 这是一个logits，这个用于表示mask是否存在
             # Calculate motion classification loss
-            cls_motion = cls_motion.view(B, args.num_ways)  # Reshape to (B, N_way)
+            cls_motion = output_cls_motion.view(B, args.num_ways)  # Reshape to (B, N_way)
             # Check if there are foreground pixels in query masks
             cls_target = (query_masks.sum(dim=(2,3,4)) > 0).float()  # B, N_way
-            motion_cls_loss = F.binary_cross_entropy_with_logits(cls_motion, cls_target)
+            pos_weight = torch.ones_like(cls_target) * 3.0  # Weight for positive examples
+            motion_cls_loss = F.binary_cross_entropy_with_logits(cls_motion, cls_target, pos_weight=pos_weight)
             
             # Only calculate loss for objects with foreground masks
             valid_mask = cls_target > 0
@@ -245,7 +254,18 @@ def train():
             
             # Add motion classification loss to total loss
             
-            total_loss = args.ce_loss_weight * (mask_ce_loss + proposal_ce_loss) + args.iou_loss_weight * (mask_iou_loss + proposal_iou_loss) + args.cls_loss_weight * motion_cls_loss
+            # gt part
+            gt_ce_loss, gt_iou_loss = criterion(gt_output_masks.flatten(1, 2), query_masks.flatten(1, 2))
+            # Apply higher penalty for false positives (predicting 1 when it should be 0)
+            # pos_weight = torch.ones_like(cls_target) * 2.0  # Weight for positive examples
+            gt_motion_cls_loss = F.binary_cross_entropy_with_logits(
+                gt_cls_motion[..., 0], 
+                cls_target, 
+                pos_weight=pos_weight
+            )
+            support_motion_cls_loss = F.binary_cross_entropy_with_logits(support_output_motion_cls[..., 0], support_gt_motion_cls, pos_weight=pos_weight)
+            
+            total_loss = args.ce_loss_weight * (mask_ce_loss + proposal_ce_loss + gt_ce_loss) + args.iou_loss_weight * (mask_iou_loss + proposal_iou_loss + gt_iou_loss) + args.cls_loss_weight * (motion_cls_loss + gt_motion_cls_loss + support_motion_cls_loss)
         
         # Backward pass with gradient scaling
         scaler.scale(total_loss).backward()
@@ -261,6 +281,10 @@ def train():
         moving_mask_iou_loss = 0.9 * moving_mask_iou_loss + 0.1 * mask_iou_loss.item() if episode > 0 else mask_iou_loss.item()
         moving_proposal_iou_loss = 0.9 * moving_proposal_iou_loss + 0.1 * proposal_iou_loss.item() if episode > 0 else proposal_iou_loss.item()
         moving_motion_cls_loss = 0.9 * moving_motion_cls_loss + 0.1 * motion_cls_loss.item() if episode > 0 else motion_cls_loss.item()
+        moving_gt_ce_loss = 0.9 * moving_gt_ce_loss + 0.1 * gt_ce_loss.item() if episode > 0 else gt_ce_loss.item()
+        moving_gt_iou_loss = 0.9 * moving_gt_iou_loss + 0.1 * gt_iou_loss.item() if episode > 0 else gt_iou_loss.item()
+        moving_gt_motion_cls_loss = 0.9 * moving_gt_motion_cls_loss + 0.1 * gt_motion_cls_loss.item() if episode > 0 else gt_motion_cls_loss.item()
+        moving_support_motion_cls_loss = 0.9 * moving_support_motion_cls_loss + 0.1 * support_motion_cls_loss.item() if episode > 0 else support_motion_cls_loss.item()
         moving_loss = 0.9 * moving_loss + 0.1 * total_loss.item() if episode > 0 else total_loss.item()
         
         # Log to tensorboard
@@ -270,6 +294,10 @@ def train():
             writer.add_scalar('Loss/Mask_IoU', moving_mask_iou_loss, episode)
             writer.add_scalar('Loss/Proposal_IoU', moving_proposal_iou_loss, episode)
             writer.add_scalar('Loss/Motion_Cls', moving_motion_cls_loss, episode)
+            writer.add_scalar('Loss/GT_CE', moving_gt_ce_loss, episode)
+            writer.add_scalar('Loss/GT_IoU', moving_gt_iou_loss, episode)
+            writer.add_scalar('Loss/GT_Motion_Cls', moving_gt_motion_cls_loss, episode)
+            writer.add_scalar('Loss/Support_Motion_Cls', moving_support_motion_cls_loss, episode)
             writer.add_scalar('Loss/Total', moving_loss, episode)
             writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], episode)
         
@@ -289,6 +317,10 @@ def train():
                             f'Mask IoU Loss: {moving_mask_iou_loss:.4f}, '
                             f'Proposal IoU Loss: {moving_proposal_iou_loss:.4f}, '
                             f'Motion Cls Loss: {moving_motion_cls_loss:.4f}, '
+                            f'GT CE Loss: {moving_gt_ce_loss:.4f}, '
+                            f'GT IoU Loss: {moving_gt_iou_loss:.4f}, '
+                            f'GT Motion Cls Loss: {moving_gt_motion_cls_loss:.4f}, '
+                            f'Support Motion Cls Loss: {moving_support_motion_cls_loss:.4f}, '
                             f'Total Loss: {moving_loss:.4f}, '
                             f'LR: {scheduler.get_last_lr()[0]:.6f}, '
                             f'ETA: {eta}')

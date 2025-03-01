@@ -56,7 +56,7 @@ def test():
     
     # Setup DDP and get local rank
     local_rank = setup_ddp()
-    
+
     # Set random seed for reproducibility
     seed = 1234
     torch.manual_seed(seed)
@@ -192,12 +192,13 @@ def test():
                 pred_maps = torch.cat(pred_maps, dim=2)  # torch.Size([1, 2, 60, 1, 241, 425])
                 pred_cls = torch.cat(pred_cls, dim=0)  # torch.Size([1, 2])
                 pred_cls = torch.mean(pred_cls, dim=0, keepdim=True)  # torch.Size([B, N_way])
-                print(pred_cls, cls_target)
 
                 # Calculate classification accuracy
                 mask_thr = 0.5
                 pred_cls_binary = (pred_cls > mask_thr).float()
                 pred_cls_sigmoid = pred_cls.sigmoid()
+                
+                pred_cls_sigmoid = cls_target  # 使用ground truth替代预测的类别
                 
                 # Calculate overall accuracy
                 correct = (pred_cls_binary == cls_target).sum().item()
@@ -253,7 +254,7 @@ def test():
                 
                 # 修改后的合并逻辑：将每个way的mask中大于阈值的部分赋值为对应的pred_cls的值
                 B, N, T, _, H, W = pred_maps.shape
-                pred_cls_sigmoid = pred_cls.sigmoid()  # 确保pred_cls是sigmoid后的值
+                # pred_cls_sigmoid = cls_target  # 使用ground truth替代预测的类别
                 
                 # 创建one-hot编码的mask
                 one_hot_masks = torch.zeros(B, N+1, T, H, W, device=pred_maps.device)
@@ -262,7 +263,6 @@ def test():
                 # 如果所有way的mask值都小于阈值，则为背景
                 background_mask = (pred_maps.max(dim=1)[0] < mask_thr).squeeze(2)  # B x T x H x W
                 one_hot_masks[:,0] = background_mask
-                one_hot_masks[:,0] = 0.4
                 
                 # 对于每个way，将大于阈值的位置赋值为对应的pred_cls值
                 for n in range(N):

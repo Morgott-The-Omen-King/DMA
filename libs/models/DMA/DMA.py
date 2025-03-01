@@ -173,8 +173,118 @@ class DMA(nn.Module):
         mask_feats = mask_feats.sum(dim=-1) / (mask.sum(dim=-1, keepdim=True) + 1e-6)
         
         return mask_feats
-        
+    
     def forward(self, query_video, support_video, support_mask, query_mask=None):
+        if self.training:
+            return self.forward_train(query_video, support_video, support_mask, query_mask)
+        else:
+            return self.forward_test(query_video, support_video, support_mask, query_mask)
+        
+    def forward_train(self, query_video, support_video, support_mask, query_mask=None):
+        # Shape检查
+        B, T, C, H, W = query_video.shape
+        assert C == 3, f"Expected 3 channels, got {C}"
+        assert support_video.shape == (B, self.n_way, self.k_shot, self.num_support_frames, 3, H, W)
+        assert support_mask.shape == (B, self.n_way, self.k_shot, self.num_support_frames, H, W)
+        assert query_mask.shape == (B, self.n_way, T, H, W)
+        
+        query_features = self.extract_features(query_video.reshape(B*T, C, H, W), mask_feats=True)
+        support_features = self.extract_features(support_video.view(-1, C, H, W), mask_feats=True)
+    
+        proposal_masks = []
+        
+        predict_mask_list = []
+        predict_cls_list = []
+        
+        gt_mask_list = []
+        gt_cls_list = []
+        
+        support_motion_prototypes = []
+        support_motion_pe = []
+        for N_way in range(self.n_way):
+            # 单独处理每一个way
+            s_f32, s_f16, s_f8, s_f4 = support_features['ms_feats']
+            s_f32 = s_f32.view(B, self.n_way, self.k_shot, self.num_support_frames, -1, *s_f32.shape[-2:])
+            s_f16 = s_f16.view(B, self.n_way, self.k_shot, self.num_support_frames, -1, *s_f16.shape[-2:])
+            s_f8 = s_f8.view(B, self.n_way, self.k_shot, self.num_support_frames, -1, *s_f8.shape[-2:])
+            s_f4 = s_f4.view(B, self.n_way, self.k_shot, self.num_support_frames, -1, *s_f4.shape[-2:])
+            
+            s_f32 = s_f32[:, N_way].flatten(0, 2)
+            s_f16 = s_f16[:, N_way].flatten(0, 2)
+            s_f8 = s_f8[:, N_way].flatten(0, 2)
+            s_f4 = s_f4[:, N_way].flatten(0, 2)
+            
+            s_mask = support_mask[:, N_way].flatten(0, 2)
+            gt_query_mask = query_mask[:, N_way].flatten(0, 1)
+            
+            # support prototype
+            s_mask_feats = self.mask_pooling(s_f4, s_mask)
+            s_motion_p, s_motion_pe = self.motion_prototype_network(s_mask_feats.view(B, self.k_shot, self.num_support_frames, -1), self.k_shot, self.num_support_frames)
+            support_motion_prototypes.append(s_motion_p)
+            support_motion_pe.append(s_motion_pe)
+            
+            # predict_query_mask
+            q_f32, q_f16, q_f8, q_f4 = query_features['ms_feats']
+            query_proposal_mask = self.proposal_generator(q_f32, q_f16, q_f8, s_motion_p, s_motion_pe)  # 需要添加一个motion_aware模块
+            
+            # gt_query_mask motion prototype
+            gt_query_mask_feats = self.mask_pooling(q_f4, gt_query_mask)
+            gt_query_motion_p, gt_query_motion_pe = self.motion_prototype_network(gt_query_mask_feats.view(B, 1, T, -1), 1, T)
+            enhance_gt_query_motion_p, enhance_gt_query_motion_pe, gt_motion_cls = self.prototype_enhancer(gt_query_motion_p, gt_query_motion_pe, s_motion_p, s_motion_pe)
+            
+            gt_output_mask = self.motion_aware_decoder(enhance_gt_query_motion_p,
+                                    enhance_gt_query_motion_pe, 
+                                    q_f16.view(B, T, -1, *q_f16.shape[-2:]), 
+                                    q_f8.view(B, T, -1, *q_f8.shape[-2:]), 
+                                    q_f4.view(B, T, -1, *q_f4.shape[-2:]))
+            
+            gt_mask_list.append(gt_output_mask)
+            gt_cls_list.append(self.motion_cls_head(gt_motion_cls))
+            
+            # motion prototype
+            q_mask_feats = self.mask_pooling(q_f4, query_proposal_mask.sigmoid())
+            q_motion_p, q_motion_pe = self.motion_prototype_network(q_mask_feats.view(B, 1, T, -1), 1, T)
+
+            enhance_q_motion_p, enhance_q_motion_pe, q_motion_cls = self.prototype_enhancer(q_motion_p, q_motion_pe, s_motion_p, s_motion_pe)
+            
+            # motion aware decoder
+            mask = self.motion_aware_decoder(enhance_q_motion_p, 
+                                             enhance_q_motion_pe, 
+                                             q_f16.view(B, T, -1, *q_f16.shape[-2:]), 
+                                             q_f8.view(B, T, -1, *q_f8.shape[-2:]), 
+                                             q_f4.view(B, T, -1, *q_f4.shape[-2:]))
+            
+            q_motion_cls = self.motion_cls_head(q_motion_cls)
+            predict_cls_list.append(q_motion_cls)
+            predict_mask_list.append(mask)
+            
+            
+            proposal_masks.append(query_proposal_mask.view(B, T, *query_proposal_mask.shape[-2:]))
+            
+        predict_mask = torch.stack(predict_mask_list, dim=1)
+        predict_cls = torch.stack(predict_cls_list, dim=1)
+        
+        gt_mask = torch.stack(gt_mask_list, dim=1)
+        gt_cls = torch.stack(gt_cls_list, dim=1)
+        
+        proposal_masks = torch.stack(proposal_masks, dim=1)
+        
+        support_motion_prototype_1 = support_motion_prototypes[0]
+        support_motion_pe_1 = support_motion_pe[0]
+        support_motion_prototype_2 = support_motion_prototypes[1]
+        support_motion_pe_2 = support_motion_pe[1]
+        
+        _, _, gt_motion_cls_1 = self.prototype_enhancer(support_motion_prototype_1, support_motion_pe_1, support_motion_prototype_2, support_motion_pe_2)
+        _, _, gt_motion_cls_2 = self.prototype_enhancer(support_motion_prototype_2, support_motion_pe_2, support_motion_prototype_1, support_motion_pe_1)
+        gt_motion_cls_1 = self.motion_cls_head(gt_motion_cls_1)
+        gt_motion_cls_2 = self.motion_cls_head(gt_motion_cls_2)
+        
+        support_output_motion_cls = torch.stack([gt_motion_cls_1, gt_motion_cls_2], dim=1)
+        support_gt_motion_cls = torch.zeros_like(support_output_motion_cls)[..., 0]
+        
+        return predict_mask, predict_cls, gt_mask, gt_cls, proposal_masks, support_output_motion_cls, support_gt_motion_cls
+
+    def forward_test(self, query_video, support_video, support_mask, query_mask=None):
         # Shape检查
         B, T, C, H, W = query_video.shape
         assert C == 3, f"Expected 3 channels, got {C}"
@@ -211,13 +321,7 @@ class DMA(nn.Module):
             
             # motion prototype
             q_mask_feats = self.mask_pooling(q_f4, query_proposal_mask.sigmoid())
-            try:
-                q_motion_p, q_motion_pe = self.motion_prototype_network(q_mask_feats.view(B, 1, T, -1), 1, T)
-            except Exception as e:
-                print(e)
-                print(q_mask_feats.shape)
-                print(q_f4.shape)
-                raise e
+            q_motion_p, q_motion_pe = self.motion_prototype_network(q_mask_feats.view(B, 1, T, -1), 1, T)
             
             enhance_q_motion_p, enhance_q_motion_pe, q_motion_cls = self.prototype_enhancer(q_motion_p, q_motion_pe, s_motion_p, s_motion_pe)
             
@@ -228,7 +332,6 @@ class DMA(nn.Module):
                                              q_f8.view(B, T, -1, *q_f8.shape[-2:]), 
                                              q_f4.view(B, T, -1, *q_f4.shape[-2:]))
             
-            q_motion_cls = self.motion_cls_norm(q_motion_cls)
             q_motion_cls = self.motion_cls_head(q_motion_cls)
             
             N_way_mask.append(mask)
@@ -239,7 +342,6 @@ class DMA(nn.Module):
         motion_cls = torch.stack(motion_cls, dim=1)
         
         return mask, proposal_masks, motion_cls
-
 
 class MaskProposalGenerator(nn.Module):
     def __init__(self, hidden_dim):

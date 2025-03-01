@@ -233,10 +233,10 @@ def get_metrics(j_list, f_list, j_fg_list, j_bg_list, n_list, class_indexes,
         'n_acc': n_acc,
         'per_category_metrics': {
             category: {
-                'f_score': f_list[i]/max(n_list[i], 1),
-                'j_score': j_list[i]/max(n_list[i], 1),
-                'j_fg_score': j_fg_list[i]/max(n_list[i], 1),
-                'j_bg_score': j_bg_list[i]/max(n_list[i], 1),
+                'f_score': f_list[i]/n_list[i] if n_list[i] > 0 else float('nan'),
+                'j_score': j_list[i]/n_list[i] if n_list[i] > 0 else float('nan'),
+                'j_fg_score': j_fg_list[i]/n_list[i] if n_list[i] > 0 else float('nan'),
+                'j_bg_score': j_bg_list[i]/n_list[i] if n_list[i] > 0 else float('nan'),
                 'j_list': j_list[i],
                 'f_list': f_list[i],
                 'j_fg_list': j_fg_list[i],
@@ -267,7 +267,7 @@ def main():
         f_score = category_metrics['f_score']
         j_fg_score = category_metrics['j_fg_score']
         j_bg_score = category_metrics['j_bg_score']
-        jf_score = (j_score + f_score) / 2
+        jf_score = (j_score + f_score) / 2 if not (np.isnan(j_score) or np.isnan(f_score)) else float('nan')
         
         print(f"{category:<40} {j_score:>12.8f} {f_score:>12.8f} {j_fg_score:>12.8f} {j_bg_score:>12.8f} {jf_score:>12.8f}")
 
